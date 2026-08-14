@@ -171,14 +171,34 @@ def load_account_status():
     'closed' - worth confirming these are genuinely the values used in
     account_status once this is live, since a mismatch here would
     silently show £0/zero rather than erroring.
+
+    Explicitly extends the statement timeout for this one query (30s,
+    well above Supabase's pooled-connection default) and fails
+    gracefully rather than crashing the whole app if it still times
+    out - this is a supplementary feature, not core to the dashboard,
+    so a slow/unavailable customer_data query should degrade to "no
+    blocked/suspended data available" rather than taking down every
+    other tab and chart with it.
     """
     conn = get_connection()
-    query = '''
-        SELECT wallet_code, account_status
-        FROM customer_data
-        WHERE account_status IS NOT NULL
-    '''
-    return pd.read_sql(query, conn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '30000'")  # milliseconds
+        query = '''
+            SELECT wallet_code, account_status
+            FROM customer_data
+            WHERE account_status IS NOT NULL
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        conn.rollback()
+        st.warning(
+            f"Couldn't load account status from customer_data ({e}) - the "
+            "'Blocked/Suspended/Closed' row will show as 0 for every cohort "
+            "until this is resolved. Every other figure on this dashboard is "
+            "unaffected."
+        )
+        return pd.DataFrame(columns=["wallet_code", "account_status"])
 
 
 def allocate_fixed_monthly_charge(full_df, fixed_charge_amount):
