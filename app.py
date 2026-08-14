@@ -423,6 +423,15 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     pass straight into st.line_chart().
     """
     d = df.copy()
+    # Relative Month can be 0 or negative for a row representing
+    # activity BEFORE an account's own FTD (see the "Pre or Post FTD"
+    # column on "Affilka ROI Dash") - these don't belong in a chart
+    # that's specifically about a cohort's economics SINCE acquisition,
+    # so they're excluded here. Relative Month 1 is always an account's
+    # own FTD month; it can never legitimately be lower than that for
+    # this chart's purposes.
+    d = d[d["Relative Month"] >= 1]
+
     d["Total GGR"] = d["Casino GGR"] + d["SB GGR"] + d["SB Correction"]
     d["Sports GGR"] = d["SB GGR"] + d["SB Correction"]
 
