@@ -131,13 +131,15 @@ def load_roi_dash_data():
     "Original player ID" (the account's own ID) and "Activity Month"
     are needed to identify each account's own FTD-month row, for
     allocating Fixed Monthly Charge - see allocate_fixed_monthly_charge().
+    "Relative Month" and "Deposits count" feed the cumulative-by-cohort
+    charts - see build_relative_month_series().
     """
     conn = get_connection()
     query = f'''
         SELECT
-            "FTD Month", "Activity Month", "Original player ID",
+            "FTD Month", "Activity Month", "Original player ID", "Relative Month",
             "Partner ID", "Campaign ID", "Commission ID",
-            "FTD Count", "Deposits sum",
+            "FTD Count", "Deposits sum", "Deposits count",
             "Casino GGR", "SB GGR", "SB Correction",
             "Casino Bonus", "SB Bonus",
             "Free Spins Payout", "Free Bet Payout", "BOG Bonus", "Lucky Bonus",
@@ -319,10 +321,12 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     # Affiliate Costs as it did before.
     if include_affiliate_costs_in_ltv:
         sum_of_deductions = total_taxes_and_duties + total_other_fees + total_affiliate_costs
+        sum_of_deductions_label = "Sum of Deductions (incl. Affiliate Costs)"
         profit_label = "Profit (incl. Affiliate Costs)"
         ltv_label = "Player LTV (incl. Affiliate Costs)"
     else:
         sum_of_deductions = total_taxes_and_duties + total_other_fees
+        sum_of_deductions_label = "Sum of Deductions (excl. Affiliate Costs)"
         profit_label = "Profit (excl. Affiliate Costs)"
         ltv_label = "Player LTV (excl. Affiliate Costs)"
 
@@ -383,8 +387,8 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     sections.append(("Total Affiliate Costs", ["  fixed_per_player (FTD Month)", "  Rev Share (FTD Month)", "  Fixed Monthly Charge", "  VAT"]))
 
     # ── Bottom line - always last ──
-    rows["Sum of Deductions"] = sum_of_deductions
-    total_rows.add("Sum of Deductions")
+    rows[sum_of_deductions_label] = sum_of_deductions
+    total_rows.add(sum_of_deductions_label)
     rows[profit_label] = profit
     total_rows.add(profit_label)
     rows[ltv_label] = player_ltv
@@ -393,6 +397,111 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     table = pd.DataFrame(rows).T
     table = table[months]
     return table, months, total_rows, sections
+
+
+def build_relative_month_series(df, include_affiliate_costs_in_ltv):
+    """
+    Computes CUMULATIVE metrics per (FTD Month cohort, Relative Month) -
+    each cohort's running total up to and including that relative month
+    (relative month 3's value already includes 1 and 2), for the
+    "cumulative by cohort" line charts. One line per FTD Month cohort,
+    x-axis is Relative Month (1 = the cohort's own FTD month, 2 = the
+    month after, etc.).
+
+    "Count of Players Depositing" is the one NON-cumulative metric here
+    - a retention-style snapshot of how many distinct accounts in that
+    cohort made at least one deposit specifically in that relative
+    month, not a running total.
+
+    Player LTV here divides cumulative Profit by each cohort's FTD
+    Count, which is fixed per cohort (doesn't vary by relative month) -
+    summed the same way build_cohort_table() does (raw "FTD Count"
+    column, non-zero only on relative month 1 rows).
+
+    Returns a dict of {metric_name: pivoted DataFrame}, each with
+    Relative Month as the index and FTD Month as columns - ready to
+    pass straight into st.line_chart().
+    """
+    d = df.copy()
+    d["Total GGR"] = d["Casino GGR"] + d["SB GGR"] + d["SB Correction"]
+    d["Sports GGR"] = d["SB GGR"] + d["SB Correction"]
+
+    per_period = d.groupby(["FTD Month", "Relative Month"]).agg(
+        total_ggr=("Total GGR", "sum"),
+        casino_ggr=("Casino GGR", "sum"),
+        sports_ggr=("Sports GGR", "sum"),
+        deposits=("Deposits sum", "sum"),
+        free_spins=("Free Spins Payout", "sum"),
+        free_bets=("Free Bet Payout", "sum"),
+        bog=("BOG Bonus", "sum"),
+        lucky=("Lucky Bonus", "sum"),
+        rgd=("RGD Duty", "sum"),
+        gbd=("GBD Duty", "sum"),
+        hblb=("HBLB Levy", "sum"),
+        statutory=("Statutory Levy", "sum"),
+        dpf=("Data Provider Fees", "sum"),
+        cpf=("Casino Provider Fee", "sum"),
+        lcpf=("Live Casino Provider Fee", "sum"),
+        vpf=("Virtuals Provider Fee", "sum"),
+        trading_adj=("Trading Adjustments", "sum"),
+        proc_fees=("Estimated Processing Fees", "sum"),
+        admin_fees=("Admin/Platform Fees", "sum"),
+        fpp=("Actual_Fixed_Fee", "sum"),
+        rs=("Actual_RS", "sum"),
+        fmc=("Allocated Fixed Monthly Charge", "sum"),
+    ).reset_index()
+
+    per_period["total_bonus"] = per_period["free_spins"] + per_period["free_bets"] + per_period["bog"] + per_period["lucky"]
+    per_period["total_taxes"] = per_period["rgd"] + per_period["gbd"] + per_period["hblb"] + per_period["statutory"]
+    per_period["total_other_fees"] = (
+        per_period["dpf"] + per_period["cpf"] + per_period["lcpf"] + per_period["vpf"]
+        + per_period["trading_adj"] + per_period["proc_fees"] + per_period["admin_fees"]
+    )
+    per_period["vat"] = (per_period["fpp"] + per_period["rs"] + per_period["fmc"]) * 0.2
+    per_period["affiliate_costs"] = per_period["fpp"] + per_period["rs"] + per_period["fmc"] + per_period["vat"]
+
+    if include_affiliate_costs_in_ltv:
+        per_period["sum_of_deductions"] = per_period["total_taxes"] + per_period["total_other_fees"] + per_period["affiliate_costs"]
+    else:
+        per_period["sum_of_deductions"] = per_period["total_taxes"] + per_period["total_other_fees"]
+
+    per_period["profit"] = per_period["total_ggr"] - per_period["total_bonus"] - per_period["sum_of_deductions"]
+
+    # Cumulative sums, computed within each FTD Month cohort separately,
+    # sorted by Relative Month first so cumsum() accumulates in the
+    # right order even if a cohort has a gap (no rows) at some relative
+    # month partway through.
+    per_period = per_period.sort_values(["FTD Month", "Relative Month"])
+    per_period["cum_total_ggr"] = per_period.groupby("FTD Month")["total_ggr"].cumsum()
+    per_period["cum_casino_ggr"] = per_period.groupby("FTD Month")["casino_ggr"].cumsum()
+    per_period["cum_sports_ggr"] = per_period.groupby("FTD Month")["sports_ggr"].cumsum()
+    per_period["cum_deposits"] = per_period.groupby("FTD Month")["deposits"].cumsum()
+    per_period["cum_profit"] = per_period.groupby("FTD Month")["profit"].cumsum()
+
+    ftd_count_by_cohort = d.groupby("FTD Month")["FTD Count"].sum()
+    per_period["ftd_count"] = per_period["FTD Month"].map(ftd_count_by_cohort)
+    per_period["cum_player_ltv"] = (per_period["cum_profit"] / per_period["ftd_count"].replace(0, pd.NA)).fillna(0)
+
+    # Count of Players Depositing - NOT cumulative, distinct accounts
+    # with at least one deposit specifically in that relative month.
+    depositing = (
+        d[d["Deposits count"] > 0]
+        .groupby(["FTD Month", "Relative Month"])["Original player ID"]
+        .nunique()
+        .reset_index(name="players_depositing")
+    )
+
+    def pivot_metric(source_df, value_col):
+        return source_df.pivot(index="Relative Month", columns="FTD Month", values=value_col).sort_index()
+
+    return {
+        "Cumulative Total GGR": pivot_metric(per_period, "cum_total_ggr"),
+        "Cumulative Casino GGR": pivot_metric(per_period, "cum_casino_ggr"),
+        "Cumulative Sports GGR": pivot_metric(per_period, "cum_sports_ggr"),
+        "Cumulative Deposits": pivot_metric(per_period, "cum_deposits"),
+        "Cumulative Player LTV": pivot_metric(per_period, "cum_player_ltv"),
+        "Count of Players Depositing": pivot_metric(depositing, "players_depositing").fillna(0),
+    }
 
 
 def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
@@ -691,9 +800,9 @@ ROW_EXPLANATIONS = {
         "FTD-month row only - every later Activity Month for that account is £0."
     ),
     "  VAT": "20% × (fixed_per_player + Rev Share + Fixed Monthly Charge).",
-    "Sum of Deductions": (
-        "Total Taxes & Duties + Total Other Fees & Adjustments + Total Affiliate Costs "
-        "(only when 'Include Affiliate Costs in Profit / Player LTV' is ticked)."
+    "Sum of Deductions (excl. Affiliate Costs)": "Total Taxes & Duties + Total Other Fees & Adjustments.",
+    "Sum of Deductions (incl. Affiliate Costs)": (
+        "Total Taxes & Duties + Total Other Fees & Adjustments + Total Affiliate Costs."
     ),
     "Profit (excl. Affiliate Costs)": "Total GGR − Total Bonus − Sum of Deductions.",
     "Profit (incl. Affiliate Costs)": "Total GGR − Total Bonus − Sum of Deductions.",
@@ -798,18 +907,22 @@ with tab_cohort:
 
     render_cohort_table_html(table, total_rows, visible_rows)
 
-    # ── PROFIT / LTV CHARTS ──
-    profit_row = next(r for r in table.index if r.startswith("Profit"))
-    ltv_row = next(r for r in table.index if r.startswith("Player LTV"))
+    # ── CUMULATIVE BY RELATIVE MONTH CHARTS ──
+    # One line per FTD Month cohort, x-axis is Relative Month (1 =
+    # the cohort's own FTD month). Uses `filtered` (not the full `df`)
+    # so these respect the same Partner/Campaign/Commission sidebar
+    # filters as the table above.
+    st.divider()
+    st.subheader("Cumulative by FTD cohort")
+    relative_month_charts = build_relative_month_series(filtered, include_affiliate_costs)
 
-    col1, col2 = st.columns(2)
-    chart_months = list(reversed(months))  # chronological for charts
-    with col1:
-        st.subheader(profit_row)
-        st.bar_chart(table.loc[profit_row, chart_months])
-    with col2:
-        st.subheader(ltv_row)
-        st.bar_chart(table.loc[ltv_row, chart_months])
+    chart_pairs = list(relative_month_charts.items())
+    for i in range(0, len(chart_pairs), 2):
+        cols = st.columns(2)
+        for col, (chart_title, chart_df) in zip(cols, chart_pairs[i:i + 2]):
+            with col:
+                st.caption(chart_title)
+                st.line_chart(chart_df)
 
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
