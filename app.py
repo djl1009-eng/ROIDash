@@ -224,9 +224,19 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     Groups the (already-filtered) dataframe by FTD Month and computes
     every row of the cohort report, organised into clear labeled
     sections (Volume, Revenue, Bonuses, Taxes & Duties, Other Fees,
-    Affiliate Costs, then Profit/LTV last) rather than the original
-    prototype's flat top-to-bottom list. See this module's docstring
-    for the specific formula decisions that differ from the prototype.
+    Affiliate Costs, then Sum of Deductions/Profit/LTV last) rather
+    than the original prototype's flat top-to-bottom list. See this
+    module's docstring for the specific formula decisions that differ
+    from the prototype.
+
+    Sum of Deductions = Total Taxes & Duties + Total Other Fees &
+    Adjustments + Total Affiliate Costs, but ONLY when
+    include_affiliate_costs_in_ltv is True - otherwise Total Affiliate
+    Costs is excluded from it, matching whatever the sidebar toggle
+    says Profit/LTV should reflect. This means Profit's own formula
+    simplifies to Total GGR - Total Bonus - Sum of Deductions with no
+    separate Affiliate Costs subtraction step, since Sum of Deductions
+    already accounts for it conditionally.
 
     Months whose total FTD Count (summed across every account in that
     cohort) is below min_ftd_count are dropped entirely from the result
@@ -234,11 +244,16 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     with 1 FTD and negligible GGR right at the edge of the data) rather
     than a hardcoded exclusion of one specific month.
 
-    Returns (table, months, total_rows) - total_rows is the set of row
-    labels that are SUMS of other rows in the table (Total GGR, Total
-    Bonus, Total Taxes & Duties, Total Other Fees, Sum of Deductions,
-    Affiliate Costs, Profit, Player LTV), used by the display code to
-    style them distinctly (bold + shaded) from their component rows.
+    Returns (table, months, total_rows, sections):
+      total_rows: set of row labels that are SUMS of other rows (Total
+        GGR, Total Bonus, Total Taxes & Duties, Total Other Fees &
+        Adjustments, Total Affiliate Costs, Sum of Deductions, Profit,
+        Player LTV) - styled distinctly (bold + shaded) from their
+        component rows.
+      sections: list of (parent_row_label, [detail_row_labels]) tuples,
+        defining which detail rows belong under which top-level summary
+        row - used to build the expand/collapse controls and to insert
+        detail rows in the right position when a section is expanded.
     """
     all_months = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key, reverse=True)
 
@@ -292,31 +307,31 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
         + trading_adjustments + processing_fees + admin_platform_fees
     )
 
-    sum_of_deductions = total_taxes_and_duties + total_other_fees
-
     fixed_per_player = col_sum("Actual_Fixed_Fee")
     rev_share = col_sum("Actual_RS")
     fixed_monthly_charge = col_sum("Allocated Fixed Monthly Charge")
     vat = (fixed_per_player + rev_share + fixed_monthly_charge) * 0.2
-    affiliate_costs = fixed_per_player + rev_share + fixed_monthly_charge + vat
+    total_affiliate_costs = fixed_per_player + rev_share + fixed_monthly_charge + vat
 
-    # Profit / Player LTV - always the LAST rows in the table. Whether
-    # Affiliate Costs are subtracted depends on the sidebar toggle
-    # (default: excluded) - Profit and LTV move together, since LTV is
-    # just Profit divided by FTD Count, so it wouldn't make sense for
-    # one to include Affiliate Costs and the other not to.
+    # Sum of Deductions - now includes Total Affiliate Costs, but ONLY
+    # when the sidebar toggle says to include it in Profit/LTV. Moved
+    # to sit just above Profit, rather than between Other Fees and
+    # Affiliate Costs as it did before.
     if include_affiliate_costs_in_ltv:
-        profit = total_ggr - total_bonus - sum_of_deductions - affiliate_costs
+        sum_of_deductions = total_taxes_and_duties + total_other_fees + total_affiliate_costs
         profit_label = "Profit (incl. Affiliate Costs)"
         ltv_label = "Player LTV (incl. Affiliate Costs)"
     else:
-        profit = total_ggr - total_bonus - sum_of_deductions
+        sum_of_deductions = total_taxes_and_duties + total_other_fees
         profit_label = "Profit (excl. Affiliate Costs)"
         ltv_label = "Player LTV (excl. Affiliate Costs)"
+
+    profit = total_ggr - total_bonus - sum_of_deductions
     player_ltv = (profit / ftd_count.replace(0, pd.NA)).fillna(0)
 
     rows = {}
     total_rows = set()
+    sections = []
 
     # ── Volume ──
     rows["FTD Count"] = ftd_count
@@ -327,6 +342,7 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     total_rows.add("Total GGR")
     rows["  Casino GGR"] = casino_ggr
     rows["  SB GGR (incl. correction)"] = sb_ggr
+    sections.append(("Total GGR", ["  Casino GGR", "  SB GGR (incl. correction)"]))
 
     # ── Bonuses ──
     rows["Total Bonus"] = total_bonus
@@ -335,7 +351,8 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     rows["  Free Sports Bets"] = free_sports_bets
     rows["  BOG Bonus"] = bog_bonus
     rows["  Lucky Bonus"] = lucky_bonus
-    rows["Bonus % of GGR"] = bonus_pct_of_ggr
+    rows["  Bonus % of GGR"] = bonus_pct_of_ggr
+    sections.append(("Total Bonus", ["  Free Casino Spins", "  Free Sports Bets", "  BOG Bonus", "  Lucky Bonus", "  Bonus % of GGR"]))
 
     # ── Taxes & Duties ──
     rows["Total Taxes & Duties"] = total_taxes_and_duties
@@ -344,6 +361,7 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     rows["  GBD Duty"] = gbd_duty
     rows["  HBLB Levy"] = hblb_levy
     rows["  Statutory Levy"] = statutory_levy
+    sections.append(("Total Taxes & Duties", ["  Casino Tax (RGD Duty)", "  GBD Duty", "  HBLB Levy", "  Statutory Levy"]))
 
     # ── Other Fees & Adjustments ──
     rows["Total Other Fees & Adjustments"] = total_other_fees
@@ -353,20 +371,20 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     rows["  Trading Adjustments"] = trading_adjustments
     rows["  Processing Fees"] = processing_fees
     rows["  Admin/Platform Fees"] = admin_platform_fees
-
-    # ── Combined deductions total (Taxes & Duties + Other Fees) ──
-    rows["Sum of Deductions"] = sum_of_deductions
-    total_rows.add("Sum of Deductions")
+    sections.append(("Total Other Fees & Adjustments", ["  Sportsbook Provider Fees", "  Casino Provider Fees", "  Trading Adjustments", "  Processing Fees", "  Admin/Platform Fees"]))
 
     # ── Affiliate Costs ──
-    rows["Affiliate Costs"] = affiliate_costs
-    total_rows.add("Affiliate Costs")
+    rows["Total Affiliate Costs"] = total_affiliate_costs
+    total_rows.add("Total Affiliate Costs")
     rows["  fixed_per_player (FTD Month)"] = fixed_per_player
     rows["  Rev Share (FTD Month)"] = rev_share
     rows["  Fixed Monthly Charge"] = fixed_monthly_charge
     rows["  VAT"] = vat
+    sections.append(("Total Affiliate Costs", ["  fixed_per_player (FTD Month)", "  Rev Share (FTD Month)", "  Fixed Monthly Charge", "  VAT"]))
 
     # ── Bottom line - always last ──
+    rows["Sum of Deductions"] = sum_of_deductions
+    total_rows.add("Sum of Deductions")
     rows[profit_label] = profit
     total_rows.add(profit_label)
     rows[ltv_label] = player_ltv
@@ -374,7 +392,7 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
 
     table = pd.DataFrame(rows).T
     table = table[months]
-    return table, months, total_rows
+    return table, months, total_rows, sections
 
 
 def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
@@ -477,12 +495,203 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
-PERCENT_ROWS = {"Bonus % of GGR"}
+def render_cohort_table_html(table, total_rows, visible_rows):
+    """
+    Renders the cohort table as a raw HTML <table> via st.markdown,
+    rather than st.dataframe - Streamlit's native dataframe component
+    (glide-data-grid) doesn't reliably support per-row hover tooltips
+    even when the underlying pandas Styler has them set via
+    .set_tooltips(), since it renders to a canvas rather than real HTML.
+    A hand-built table with a native HTML title="..." attribute on each
+    row label gives a reliable browser-native tooltip regardless of
+    that limitation.
+
+    visible_rows: ordered list of row labels to actually render (already
+    filtered down to whichever top-level rows plus any expanded detail
+    rows the caller wants shown - this function doesn't decide which
+    rows appear, only how to render whichever list it's given).
+
+    Total/subtotal rows (in total_rows) get bold text and a shaded
+    background so it's visually obvious which rows are sums of the
+    detail rows versus individual line items.
+    """
+    import html as html_module
+
+    def format_cell(row_name, value):
+        if row_name in PERCENT_ROWS:
+            return format_pct(value)
+        elif row_name in COUNT_ROWS:
+            return "" if pd.isna(value) else f"{value:,.0f}"
+        else:
+            return format_currency(value)
+
+    months = list(table.columns)
+
+    header_cells = "".join(f"<th>{html_module.escape(str(m))}</th>" for m in months)
+    header_row = f"<tr><th>Metric</th>{header_cells}</tr>"
+
+    body_rows = []
+    for row_name in visible_rows:
+        if row_name not in table.index:
+            continue
+        is_total = row_name in total_rows
+        row_class = "total-row" if is_total else "detail-row"
+        explanation = ROW_EXPLANATIONS.get(row_name, "")
+        title_attr = html_module.escape(explanation) if explanation else ""
+        label_html = html_module.escape(row_name)
+
+        cells = "".join(
+            f"<td>{format_cell(row_name, table.loc[row_name, m])}</td>" for m in months
+        )
+        body_rows.append(
+            f'<tr class="{row_class}">'
+            f'<td class="row-label" title="{title_attr}">{label_html}</td>'
+            f'{cells}'
+            f'</tr>'
+        )
+
+    style = """
+    <style>
+        .roi-table-wrap { overflow-x: auto; }
+        .roi-table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+        .roi-table th, .roi-table td { padding: 6px 10px; text-align: right; white-space: nowrap; }
+        .roi-table th:first-child, .roi-table td:first-child { text-align: left; }
+        .roi-table thead th { border-bottom: 1px solid rgba(120,120,120,0.4); font-weight: 600; }
+        .roi-table .total-row { font-weight: bold; background-color: rgba(120,120,120,0.18); }
+        .roi-table .row-label { cursor: help; }
+        .roi-table .detail-row .row-label { padding-left: 24px; opacity: 0.9; }
+    </style>
+    """
+
+    table_html = (
+        f'{style}<div class="roi-table-wrap"><table class="roi-table">'
+        f'<thead>{header_row}</thead><tbody>{"".join(body_rows)}</tbody></table></div>'
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+PERCENT_ROWS = {"  Bonus % of GGR"}
 COUNT_ROWS = {"FTD Count"}
 # Every row not in PERCENT_ROWS or COUNT_ROWS is a currency row -
 # formatting is now driven by exclusion rather than an explicit set,
 # since row labels change dynamically (Profit/LTV's label depends on
 # the affiliate-costs toggle).
+
+# Hover-tooltip text for each row label, shown when hovering the row
+# name in the first column. Sourced from the original prototype
+# spreadsheet's Column B ("Where it comes from?"), adapted where this
+# dashboard's actual formula differs from what that column originally
+# described (e.g. SB GGR now folds in SB Correction; Fixed Monthly
+# Charge is now a flat £3,500 per FTD Month rather than the
+# spreadsheet's placeholder text; Admin/Platform Fees uses Combined
+# Stake rather than Affilka's own stake columns).
+ROW_EXPLANATIONS = {
+    "FTD Count": "Source: Affilka API\n\nFTD count direct from Affilka.",
+    "Deposits": "Source: Affilka API\n\nDeposits Sum direct from Affilka.",
+    "Total GGR": "Casino GGR + SB GGR (SB GGR already includes SB Correction, so it isn't added again separately here).",
+    "  Casino GGR": "Source: Affilka API\n\nCasino GGR direct from Affilka.",
+    "  SB GGR (incl. correction)": (
+        "Source: Affilka API + All Bets Master Log\n\n"
+        "Affilka's own sb_ggr − (sb_bets_sum − sb_settled_bets_sum), PLUS the difference "
+        "between that figure and the All Bets Master Log truth (SB Correction) - both "
+        "folded into this one figure."
+    ),
+    "Total Bonus": "Free Casino Spins + Free Sports Bets + BOG Bonus + Lucky Bonus.",
+    "  Free Casino Spins": "Source: Casino, Live Casino & Virtuals Drive reports\n\nSum of 'Free Spins Results' across all three products.",
+    "  Free Sports Bets": "Source: All Bets Master Log\n\nSum of Payout for bets where Is Free Bet = Yes.",
+    "  BOG Bonus": "Source: Trading Drive report\n\nAllocated by Player/Month/Commission, scaled by sb_bets_sum.",
+    "  Lucky Bonus": "Source: Trading Drive report\n\nAllocated by Player/Month/Commission, scaled by sb_bets_sum.",
+    "  Bonus % of GGR": "Total Bonus ÷ Total GGR.",
+    "Total Taxes & Duties": "Casino Tax (RGD Duty) + GBD Duty + HBLB Levy + Statutory Levy.",
+    "  Casino Tax (RGD Duty)": (
+        "Source: Casino, Live Casino & Virtuals Drive reports\n\n"
+        "combined_duty_base = SUM over {Casino, Live Casino, Virtuals} of (that product's "
+        "monthly GGR + monthly Free Spins count × £0.10)\n"
+        "combined_duty_pool = max(0, 40% × combined_duty_base)\n"
+        "account's share = combined_duty_pool × (account's combined stake across all 3 "
+        "products ÷ total combined stake across every account, that month)."
+    ),
+    "  GBD Duty": (
+        "Source: Trading Drive report\n\n"
+        "month_total_pnl = SUM(sports_bet_ngr) across every Wallet Code, that month\n"
+        "month_total_fb_stake = SUM(Free Bet Stake), that month\n"
+        "duty_pool = max(0, 15% × (month_total_pnl + month_total_fb_stake))\n"
+        "account's share = duty_pool × (account's own sports_bet_ngr ÷ month_total_pnl)."
+    ),
+    "  HBLB Levy": (
+        "Source: All Bets Master Log, Horse Racing bets only\n\n"
+        "month_total_net = SUM(Total stake) − SUM(Payout), settled Horse Racing bets that month\n"
+        "duty_pool = max(0, 10% × month_total_net)\n"
+        "account's share = duty_pool × (account's own Horse Racing net ÷ month_total_net)."
+    ),
+    "  Statutory Levy": (
+        "Source: Trading + Casino/Live Casino/Virtuals Drive reports\n\n"
+        "combined_contribution = sports_bet_ngr + Free Bet Stake + Casino/Live Casino/Virtuals "
+        "GGR (+ Free Spins × £0.10 each)\n"
+        "duty_pool = max(0, 1.1% × month_total_contrib)\n"
+        "account's share = duty_pool × (account's own combined_contribution ÷ month_total_contrib)."
+    ),
+    "Total Other Fees & Adjustments": (
+        "Sportsbook Provider Fees + Casino Provider Fees + Trading Adjustments + "
+        "Processing Fees + Admin/Platform Fees."
+    ),
+    "  Sportsbook Provider Fees": "Source: All Bets Master Log\n\nSum of the Data Provider Fees column.",
+    "  Casino Provider Fees": (
+        "Source: Casino, Live Casino & Virtuals Drive reports\n\n"
+        "Calculated per product and summed:\n"
+        "standalone_duty_base = that product's monthly GGR + Free Spins count × £0.10\n"
+        "standalone_duty_pool = 40% × standalone_duty_base (not netted with other products)\n"
+        "fee_pool = provider_fee_rate × (GGR − standalone_duty_pool)\n"
+        "account's share = fee_pool × (account's stake in that product ÷ total stake, that "
+        "product, that month)."
+    ),
+    "  Trading Adjustments": "Source: Trading Drive report\n\nDirect from the Trading Adjustments column.",
+    "  Processing Fees": (
+        "Source: Affilka API\n\n"
+        "pool = 5% × greatest(0, that month's combined SB GGR + Casino GGR, summed across "
+        "every account)\n"
+        "account's share = pool × (this commission's Deposits Count + Cashouts Count ÷ that "
+        "month's combined Deposits + Cashouts, across every account)."
+    ),
+    "  Admin/Platform Fees": (
+        "Source: Affilka API + Customer Trading Data Monthly\n\n"
+        "pool = £80,000 flat, per Activity Month, spanning the whole business\n"
+        "account's share = pool × (this account's Combined Stake ÷ whole-business Combined "
+        "Stake, that month)."
+    ),
+    "Total Affiliate Costs": "fixed_per_player + Rev Share + Fixed Monthly Charge + VAT.",
+    "  fixed_per_player (FTD Month)": (
+        "Source: CPA By Cohort spreadsheet\n\n"
+        "For each (Partner ID, FTD Month) cohort with real cost data:\n"
+        "fee_per_account = cohort's total CPA cost ÷ count of eligible accounts (FTD Count = 1, "
+        "not frozen in their first month)\n"
+        "written onto each eligible account's own FTD-month row.\n\n"
+        "Falls back to Affilka's own reported fixed_per_player figure if no CPA By Cohort "
+        "entry exists."
+    ),
+    "  Rev Share (FTD Month)": (
+        "Source: RS By Cohort spreadsheet\n\n"
+        "For each (Partner ID, FTD Month, Activity Month) triple with real cost data:\n"
+        "pool = that triple's RS Amount\n"
+        "each row's share = pool × (this row's GGR ÷ total GGR across every row in that triple)\n\n"
+        "Falls back to Affilka's own reported ngr_percent if no RS By Cohort entry exists. "
+        "Summed across every month the cohort has been active - lifetime revenue share to date."
+    ),
+    "  Fixed Monthly Charge": (
+        "Source: hardcoded, £3,500 per FTD Month\n\n"
+        "Split equally across that month's distinct new FTDs, written onto each account's own "
+        "FTD-month row only - every later Activity Month for that account is £0."
+    ),
+    "  VAT": "20% × (fixed_per_player + Rev Share + Fixed Monthly Charge).",
+    "Sum of Deductions": (
+        "Total Taxes & Duties + Total Other Fees & Adjustments + Total Affiliate Costs "
+        "(only when 'Include Affiliate Costs in Profit / Player LTV' is ticked)."
+    ),
+    "Profit (excl. Affiliate Costs)": "Total GGR − Total Bonus − Sum of Deductions.",
+    "Profit (incl. Affiliate Costs)": "Total GGR − Total Bonus − Sum of Deductions.",
+    "Player LTV (excl. Affiliate Costs)": "Profit ÷ FTD Count.",
+    "Player LTV (incl. Affiliate Costs)": "Profit ÷ FTD Count.",
+}
 
 
 # ── MAIN APP ──────────────────────────────────────────────────────────
@@ -558,124 +767,28 @@ tab_cohort, tab_partner, tab_campaign, tab_commission = st.tabs([
 ])
 
 with tab_cohort:
-    table, months, total_rows = build_cohort_table(filtered, include_affiliate_costs, min_ftd_count)
+    table, months, total_rows, sections = build_cohort_table(filtered, include_affiliate_costs, min_ftd_count)
 
-    # .astype(object) first - newer pandas versions raise a TypeError when
-    # assigning formatted strings (e.g. "£1,234") into a column pandas still
-    # considers float64, rather than silently upcasting like older versions
-    # did. Converting the whole table to object dtype upfront means every
-    # cell can hold either a number or a string without that strict check
-    # kicking in.
-    display_table = table.astype(object)
-    for row_name in display_table.index:
-        if row_name in PERCENT_ROWS:
-            display_table.loc[row_name] = table.loc[row_name].apply(format_pct)
-        elif row_name in COUNT_ROWS:
-            display_table.loc[row_name] = table.loc[row_name].apply(lambda v: f"{v:,.0f}")
-        else:
-            display_table.loc[row_name] = table.loc[row_name].apply(format_currency)
+    # Map each detail row label back to its parent section, so a
+    # section only shows its detail rows when explicitly expanded.
+    detail_to_parent = {}
+    for parent, details in sections:
+        for d in details:
+            detail_to_parent[d] = parent
 
-    def style_total_rows(row):
-        """
-        Bold + shaded background for total/subtotal rows (Total GGR, Total
-        Bonus, Total Taxes & Duties, Total Other Fees & Adjustments, Sum of
-        Deductions, Affiliate Costs, Profit, Player LTV) so it's visually
-        obvious at a glance which rows are sums of the detail rows sitting
-        underneath them, versus the individual line items themselves.
-        """
-        if row.name in total_rows:
-            return ["font-weight: bold; background-color: rgba(120, 120, 120, 0.18)"] * len(row)
-        return [""] * len(row)
+    expanded_sections = st.multiselect(
+        "Show detail rows for:",
+        options=[s[0] for s in sections],
+        default=[],
+        help="Pick a section to reveal the individual line items that make up its total.",
+    )
 
-    styled_table = display_table.style.apply(style_total_rows, axis=1)
-    st.dataframe(styled_table, use_container_width=True, height=min(35 * len(display_table) + 40, 900))
+    visible_rows = [
+        row_name for row_name in table.index
+        if row_name not in detail_to_parent or detail_to_parent[row_name] in expanded_sections
+    ]
 
-    with st.expander("Where do the Affiliate Costs figures come from?"):
-        st.markdown("""
-**fixed_per_player (FTD Month)**
-
-Source: `Affilka Data` (`Actual_Fixed_Fee` column) + the `CPA By Cohort` spreadsheet
-
-```
-For each (Partner ID, FTD Month) cohort with real cost data in CPA By Cohort:
-    fee_per_account = that cohort's total CPA cost ÷ count of eligible accounts
-                       (FTD Count = 1, FTD Month matches, not frozen in their first month)
-    written onto each eligible account's own FTD-month row, £0 elsewhere
-
-For any (Partner ID, FTD Month) with no CPA By Cohort entry:
-    falls back to Affilka's own reported fixed_per_player figure
-```
-
-Summed across every row belonging to that FTD Month cohort.
-
----
-
-**Rev Share (FTD Month)**
-
-Source: `Affilka Data` (`Actual_RS` column) + the `RS By Cohort` spreadsheet
-
-```
-For each (Partner ID, FTD Month, Activity Month) triple with real cost data in RS By Cohort:
-    pool = that triple's RS Amount
-    each row's share = pool × (GREATEST(this row's SB GGR + Casino GGR, 0)
-                                ÷ SUM of GREATEST(SB GGR + Casino GGR, 0)
-                                  across every row in that exact triple)
-
-For any triple with no RS By Cohort entry:
-    falls back to Affilka's own reported ngr_percent figure
-```
-
-Summed across every Activity Month this cohort has been active in - i.e. the
-cohort's lifetime revenue share to date, not just their FTD month.
-
----
-
-**Fixed Monthly Charge**
-
-Source: a flat, hardcoded £3,500 per FTD Month, split equally across that
-month's new signups
-
-```
-£3,500 has no source anywhere in Affilka or the underlying reports - a
-genuinely external, fixed acquisition cost, applied per FTD Month (not
-Activity Month - it's paid only in an account's own first month, not
-spread across their whole lifetime activity).
-
-each account's share = £3,500 ÷ (count of distinct accounts whose
-                                  FTD Month is that same month)
-
-written onto exactly one row per account (their own FTD-month row) -
-every other row for that account, in any later Activity Month, is £0.
-```
-
-Summed by FTD Month cohort for display here, same as everything else -
-which means this row's total for each FTD Month column will sum to
-exactly £3,500 (split however many ways that month had new FTDs).
-
----
-
-**VAT**
-
-Source: calculated in this dashboard
-
-```
-VAT = 20% × (fixed_per_player + Rev Share + Fixed Monthly Charge)
-```
-
-for that FTD Month cohort.
-
----
-
-**Affiliate Costs**
-
-Source: calculated in this dashboard
-
-```
-Affiliate Costs = fixed_per_player + Rev Share + Fixed Monthly Charge + VAT
-```
-
-for that FTD Month cohort.
-""")
+    render_cohort_table_html(table, total_rows, visible_rows)
 
     # ── PROFIT / LTV CHARTS ──
     profit_row = next(r for r in table.index if r.startswith("Profit"))
@@ -690,10 +803,6 @@ for that FTD Month cohort.
         st.subheader(ltv_row)
         st.bar_chart(table.loc[ltv_row, chart_months])
 
-    st.caption(
-        f"Fixed Monthly Charge: a flat £{FIXED_MONTHLY_CHARGE_AMOUNT:,.0f} per FTD Month, "
-        "split equally across that month's new signups (see the explanation above)."
-    )
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
 
