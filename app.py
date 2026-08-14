@@ -112,13 +112,55 @@ if not check_password():
 
 @st.cache_resource
 def get_connection():
-    return psycopg2.connect(
+    """
+    This connection is cached (via st.cache_resource) and shared across
+    EVERY query, EVERY rerun, and EVERY user session of the app - not
+    per-session, genuinely global. autocommit=True is essential here:
+    without it, any single failed query (a timeout, a bad connection,
+    anything) leaves this ONE shared connection stuck in Postgres's
+    "current transaction is aborted" state, and every subsequent query
+    by every user then fails too, until the whole app process restarts.
+    This is exactly what happened on 2026-08-14 - a customer_data query
+    timed out, and the resulting cascade of "25P02" errors in the
+    Supabase logs confirms the stuck-transaction pattern. With
+    autocommit=True, each statement succeeds or fails independently, so
+    one bad query can never poison every query after it. This app never
+    needs multi-statement transactional consistency anyway (every query
+    here is an independent read), so there's no downside to it.
+    """
+    conn = psycopg2.connect(
         host=DB_HOST,
         dbname=DB_NAME,
         user=DB_USER,
         password=st.secrets["db_password"],
         port=DB_PORT,
     )
+    conn.autocommit = True
+    return conn
+
+
+def get_healthy_connection():
+    """
+    Returns the cached connection, transparently reconnecting if it's
+    been closed or gone stale (e.g. after a network blip, or the
+    Supabase pooler recycling it server-side - "connection to client
+    lost" / "Broken pipe" both appeared in the Supabase logs during the
+    same incident above). st.cache_resource caches the connection
+    object indefinitely, so without this check, a dead connection would
+    keep being returned - and keep failing every single query - until
+    the whole app process restarts. Every query function in this app
+    should call this instead of get_connection() directly.
+    """
+    conn = get_connection()
+    try:
+        if conn.closed:
+            raise psycopg2.OperationalError("connection is closed")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        get_connection.clear()
+        conn = get_connection()
+    return conn
 
 
 @st.cache_data(ttl=600)
@@ -135,7 +177,7 @@ def load_roi_dash_data():
     "Relative Month" and "Deposits count" feed the cumulative-by-cohort
     charts - see build_relative_month_series().
     """
-    conn = get_connection()
+    conn = get_healthy_connection()
     query = f'''
         SELECT
             "FTD Month", "Activity Month", "Original player ID", "Relative Month",
@@ -180,7 +222,7 @@ def load_account_status():
     blocked/suspended data available" rather than taking down every
     other tab and chart with it.
     """
-    conn = get_connection()
+    conn = get_healthy_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = '30000'")  # milliseconds
@@ -191,7 +233,9 @@ def load_account_status():
         '''
         return pd.read_sql(query, conn)
     except Exception as e:
-        conn.rollback()
+        # No conn.rollback() needed here - autocommit=True (see
+        # get_connection()) means there's never a pending transaction
+        # for a failed statement to leave behind.
         st.warning(
             f"Couldn't load account status from customer_data ({e}) - the "
             "'Blocked/Suspended/Closed' row will show as 0 for every cohort "
