@@ -326,6 +326,101 @@ def build_cohort_table(df, fixed_charges, include_affiliate_costs_in_ltv):
     return table, months, total_rows
 
 
+def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
+    """
+    Groups the (already-filtered) dataframe by group_col (Partner ID,
+    Campaign ID, or Commission ID) and computes each group's LIFETIME
+    Profit and Player LTV, sorted highest-LTV-first.
+
+    IMPORTANT DIFFERENCE from build_cohort_table's Affiliate Costs:
+    "Fixed Monthly Charge" is a whole-business figure keyed only by FTD
+    Month (see the "Dashboard Fixed Monthly Charge" table) - it has no
+    way to be attributed to a specific Partner/Campaign/Commission, so
+    it's EXCLUDED here entirely (along with its own 20% VAT
+    contribution), unlike the FTD cohort table where it's included.
+    Affiliate Costs here = Actual_Fixed_Fee + Actual_RS (both already
+    genuinely row-level in the source view, so summing them by group_col
+    is exactly as valid as summing Casino GGR by group_col) + VAT on
+    just those two. This means a group's Affiliate Costs here will be
+    SMALLER than its true share would be if Fixed Monthly Charge could
+    be fairly allocated - flagged clearly in the UI caption, not just
+    here.
+
+    Returns a DataFrame with one row per group_col value, sorted by
+    Player LTV descending (highest LTV first, matching "top to bottom"
+    ranking).
+    """
+    grouped = df.groupby(group_col)
+
+    def col_sum(col):
+        return grouped[col].sum()
+
+    ftd_count = col_sum("FTD Count")
+    casino_ggr = col_sum("Casino GGR")
+    sb_ggr = col_sum("SB GGR") + col_sum("SB Correction")
+    total_ggr = casino_ggr + sb_ggr
+
+    total_bonus = (
+        col_sum("Free Spins Payout") + col_sum("Free Bet Payout")
+        + col_sum("BOG Bonus") + col_sum("Lucky Bonus")
+    )
+
+    total_taxes_and_duties = (
+        col_sum("RGD Duty") + col_sum("GBD Duty")
+        + col_sum("HBLB Levy") + col_sum("Statutory Levy")
+    )
+    total_other_fees = (
+        col_sum("Data Provider Fees")
+        + col_sum("Casino Provider Fee") + col_sum("Live Casino Provider Fee") + col_sum("Virtuals Provider Fee")
+        + col_sum("Trading Adjustments") + col_sum("Estimated Processing Fees") + col_sum("Admin/Platform Fees")
+    )
+    sum_of_deductions = total_taxes_and_duties + total_other_fees
+
+    fixed_per_player = col_sum("Actual_Fixed_Fee")
+    rev_share = col_sum("Actual_RS")
+    vat = (fixed_per_player + rev_share) * 0.2
+    affiliate_costs = fixed_per_player + rev_share + vat
+
+    if include_affiliate_costs_in_ltv:
+        profit = total_ggr - total_bonus - sum_of_deductions - affiliate_costs
+        profit_label = "Profit (incl. Affiliate Costs)"
+        ltv_label = "Player LTV (incl. Affiliate Costs)"
+    else:
+        profit = total_ggr - total_bonus - sum_of_deductions
+        profit_label = "Profit (excl. Affiliate Costs)"
+        ltv_label = "Player LTV (excl. Affiliate Costs)"
+    player_ltv = (profit / ftd_count.replace(0, pd.NA)).fillna(0)
+
+    result = pd.DataFrame({
+        "FTD Count": ftd_count,
+        "Total GGR": total_ggr,
+        "Total Bonus": total_bonus,
+        "Sum of Deductions": sum_of_deductions,
+        "Affiliate Costs": affiliate_costs,
+        profit_label: profit,
+        ltv_label: player_ltv,
+    })
+    result = result.sort_values(ltv_label, ascending=False)
+    result.index.name = group_col
+    return result, profit_label, ltv_label
+
+
+def format_ranking_table(result, profit_label, ltv_label):
+    """
+    Currency-formats every column except FTD Count (a plain integer
+    count), returning a display-ready copy. Same .astype(object)
+    upfront pattern as the cohort table, for the same reason (newer
+    pandas rejects writing formatted strings into a float64 column).
+    """
+    display = result.astype(object)
+    for col in display.columns:
+        if col == "FTD Count":
+            display[col] = result[col].apply(lambda v: f"{v:,.0f}")
+        else:
+            display[col] = result[col].apply(format_currency)
+    return display
+
+
 def format_currency(v):
     if pd.isna(v):
         return ""
@@ -394,75 +489,98 @@ if filtered.empty:
     st.warning("No data matches the selected filters.")
     st.stop()
 
-# ── COHORT TABLE ─────────────────────────────────────────────────────
+# ── TABS ─────────────────────────────────────────────────────────────
 
-table, months, total_rows = build_cohort_table(filtered, fixed_charges, include_affiliate_costs)
+tab_cohort, tab_partner, tab_campaign, tab_commission = st.tabs([
+    "FTD Cohort View", "By Partner ID", "By Campaign ID", "By Commission ID",
+])
 
-# .astype(object) first - newer pandas versions raise a TypeError when
-# assigning formatted strings (e.g. "£1,234") into a column pandas still
-# considers float64, rather than silently upcasting like older versions
-# did. Converting the whole table to object dtype upfront means every
-# cell can hold either a number or a string without that strict check
-# kicking in.
-display_table = table.astype(object)
-for row_name in display_table.index:
-    if row_name in PERCENT_ROWS:
-        display_table.loc[row_name] = table.loc[row_name].apply(format_pct)
-    elif row_name in COUNT_ROWS:
-        display_table.loc[row_name] = table.loc[row_name].apply(lambda v: f"{v:,.0f}")
-    else:
-        display_table.loc[row_name] = table.loc[row_name].apply(format_currency)
+with tab_cohort:
+    table, months, total_rows = build_cohort_table(filtered, fixed_charges, include_affiliate_costs)
+
+    # .astype(object) first - newer pandas versions raise a TypeError when
+    # assigning formatted strings (e.g. "£1,234") into a column pandas still
+    # considers float64, rather than silently upcasting like older versions
+    # did. Converting the whole table to object dtype upfront means every
+    # cell can hold either a number or a string without that strict check
+    # kicking in.
+    display_table = table.astype(object)
+    for row_name in display_table.index:
+        if row_name in PERCENT_ROWS:
+            display_table.loc[row_name] = table.loc[row_name].apply(format_pct)
+        elif row_name in COUNT_ROWS:
+            display_table.loc[row_name] = table.loc[row_name].apply(lambda v: f"{v:,.0f}")
+        else:
+            display_table.loc[row_name] = table.loc[row_name].apply(format_currency)
+
+    def style_total_rows(row):
+        """
+        Bold + shaded background for total/subtotal rows (Total GGR, Total
+        Bonus, Total Taxes & Duties, Total Other Fees & Adjustments, Sum of
+        Deductions, Affiliate Costs, Profit, Player LTV) so it's visually
+        obvious at a glance which rows are sums of the detail rows sitting
+        underneath them, versus the individual line items themselves.
+        """
+        if row.name in total_rows:
+            return ["font-weight: bold; background-color: rgba(120, 120, 120, 0.18)"] * len(row)
+        return [""] * len(row)
+
+    styled_table = display_table.style.apply(style_total_rows, axis=1)
+    st.dataframe(styled_table, use_container_width=True, height=min(35 * len(display_table) + 40, 900))
+
+    # ── PROFIT / LTV CHARTS ──
+    profit_row = next(r for r in table.index if r.startswith("Profit"))
+    ltv_row = next(r for r in table.index if r.startswith("Player LTV"))
+
+    col1, col2 = st.columns(2)
+    chart_months = list(reversed(months))  # chronological for charts
+    with col1:
+        st.subheader(profit_row)
+        st.bar_chart(table.loc[profit_row, chart_months])
+    with col2:
+        st.subheader(ltv_row)
+        st.bar_chart(table.loc[ltv_row, chart_months])
+
+    # ── FIXED MONTHLY CHARGE EDITOR ──
+    st.divider()
+    st.subheader("Edit Fixed Monthly Charge")
+    st.caption(
+        "This figure has no source in the data - it's entered manually per FTD month "
+        "and persists here across sessions."
+    )
+
+    edit_month = st.selectbox("FTD Month", months, key="fixed_charge_month")
+    current_value = fixed_charges.get(edit_month, 0.0)
+    new_value = st.number_input(
+        f"Fixed Monthly Charge for {edit_month} (£)",
+        value=float(current_value),
+        step=100.0,
+    )
+    if st.button("Save"):
+        save_fixed_charge(edit_month, new_value)
+        st.success(f"Saved £{new_value:,.2f} for {edit_month}.")
+        st.rerun()
+
+    st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
 
-def style_total_rows(row):
-    """
-    Bold + shaded background for total/subtotal rows (Total GGR, Total
-    Bonus, Total Taxes & Duties, Total Other Fees & Adjustments, Sum of
-    Deductions, Affiliate Costs, Profit, Player LTV) so it's visually
-    obvious at a glance which rows are sums of the detail rows sitting
-    underneath them, versus the individual line items themselves.
-    """
-    if row.name in total_rows:
-        return ["font-weight: bold; background-color: rgba(120, 120, 120, 0.18)"] * len(row)
-    return [""] * len(row)
+def render_ranking_tab(tab, group_col, label):
+    with tab:
+        st.subheader(f"Ranked by Player LTV - {label}")
+        st.caption(
+            "Lifetime totals across every FTD cohort, ranked highest Player LTV first. "
+            "**Affiliate Costs here excludes Fixed Monthly Charge** (and its VAT) - that "
+            "figure is a whole-business monthly cost with no way to attribute to a "
+            "specific Partner, Campaign, or Commission, unlike everything else here, "
+            "which is already row-level in the source data."
+        )
+        result, profit_label, ltv_label = build_ranking_table(filtered, group_col, include_affiliate_costs)
+        display = format_ranking_table(result, profit_label, ltv_label)
+        st.dataframe(display, use_container_width=True, height=min(35 * len(display) + 80, 700))
+
+        st.bar_chart(result[ltv_label])
 
 
-styled_table = display_table.style.apply(style_total_rows, axis=1)
-st.dataframe(styled_table, use_container_width=True, height=min(35 * len(display_table) + 40, 900))
-
-# ── PROFIT / LTV CHARTS ──────────────────────────────────────────────
-
-profit_row = next(r for r in table.index if r.startswith("Profit"))
-ltv_row = next(r for r in table.index if r.startswith("Player LTV"))
-
-col1, col2 = st.columns(2)
-chart_months = list(reversed(months))  # chronological for charts
-with col1:
-    st.subheader(profit_row)
-    st.bar_chart(table.loc[profit_row, chart_months])
-with col2:
-    st.subheader(ltv_row)
-    st.bar_chart(table.loc[ltv_row, chart_months])
-
-# ── FIXED MONTHLY CHARGE EDITOR ──────────────────────────────────────
-
-st.divider()
-st.subheader("Edit Fixed Monthly Charge")
-st.caption(
-    "This figure has no source in the data - it's entered manually per FTD month "
-    "and persists here across sessions."
-)
-
-edit_month = st.selectbox("FTD Month", months, key="fixed_charge_month")
-current_value = fixed_charges.get(edit_month, 0.0)
-new_value = st.number_input(
-    f"Fixed Monthly Charge for {edit_month} (£)",
-    value=float(current_value),
-    step=100.0,
-)
-if st.button("Save"):
-    save_fixed_charge(edit_month, new_value)
-    st.success(f"Saved £{new_value:,.2f} for {edit_month}.")
-    st.rerun()
-
-st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
+render_ranking_tab(tab_partner, "Partner ID", "Partner ID")
+render_ranking_tab(tab_campaign, "Campaign ID", "Campaign ID")
+render_ranking_tab(tab_commission, "Commission ID", "Commission ID")
