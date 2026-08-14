@@ -537,7 +537,7 @@ def render_cohort_table_html(table, total_rows, visible_rows):
         is_total = row_name in total_rows
         row_class = "total-row" if is_total else "detail-row"
         explanation = ROW_EXPLANATIONS.get(row_name, "")
-        title_attr = html_module.escape(explanation) if explanation else ""
+        title_attr = html_module.escape(explanation).replace("\n", "&#10;") if explanation else ""
         label_html = html_module.escape(row_name)
 
         cells = "".join(
@@ -550,18 +550,26 @@ def render_cohort_table_html(table, total_rows, visible_rows):
             f'</tr>'
         )
 
-    style = """
-    <style>
-        .roi-table-wrap { overflow-x: auto; }
-        .roi-table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
-        .roi-table th, .roi-table td { padding: 6px 10px; text-align: right; white-space: nowrap; }
-        .roi-table th:first-child, .roi-table td:first-child { text-align: left; }
-        .roi-table thead th { border-bottom: 1px solid rgba(120,120,120,0.4); font-weight: 600; }
-        .roi-table .total-row { font-weight: bold; background-color: rgba(120,120,120,0.18); }
-        .roi-table .row-label { cursor: help; }
-        .roi-table .detail-row .row-label { padding-left: 24px; opacity: 0.9; }
-    </style>
-    """
+    # Built as a SINGLE unbroken line with zero leading whitespace on
+    # any line - Streamlit's markdown renderer treats 4+ leading spaces
+    # on a line as a code block (standard Markdown behaviour), which
+    # would escape these HTML tags into literal visible text instead of
+    # rendering them. A dedented multi-line string can still trip this
+    # if any inner line (e.g. indented CSS rules) keeps its indentation
+    # - collapsing everything to one line sidesteps the issue entirely,
+    # regardless of how the parser handles edge cases.
+    style = (
+        "<style>"
+        ".roi-table-wrap{overflow-x:auto;}"
+        ".roi-table{border-collapse:collapse;width:100%;font-size:0.9rem;}"
+        ".roi-table th,.roi-table td{padding:6px 10px;text-align:right;white-space:nowrap;}"
+        ".roi-table th:first-child,.roi-table td:first-child{text-align:left;}"
+        ".roi-table thead th{border-bottom:1px solid rgba(120,120,120,0.4);font-weight:600;}"
+        ".roi-table .total-row{font-weight:bold;background-color:rgba(120,120,120,0.18);}"
+        ".roi-table .row-label{cursor:help;}"
+        ".roi-table .detail-row .row-label{padding-left:24px;opacity:0.9;}"
+        "</style>"
+    )
 
     table_html = (
         f'{style}<div class="roi-table-wrap"><table class="roi-table">'
