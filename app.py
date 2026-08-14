@@ -30,17 +30,15 @@ in a few places - see commit history / conversation for why):
     summed by FTD Month - unchanged from the prototype.
   - "Fixed Monthly Charge" (renamed from the prototype's placeholder
     "Fixed fee" row, which was dummy incrementing test data) has no
-    source anywhere in the view - the pool itself is a manually-entered,
-    genuinely external monthly cost. Entered per Activity Month (not FTD
-    Month - it's a monthly business cost, not an acquisition cost) via a
-    small dedicated Supabase table ("Dashboard Fixed Monthly Charge"),
-    then allocated per-account by Combined Stake share - same method as
-    Admin/Platform Fees, but restricted to affiliate accounts only,
-    since this charge is only paid by accounts with an affiliate (see
-    allocate_fixed_monthly_charge()). This also means it can now be
-    correctly included in the Partner/Campaign/Commission ranking
-    tables, unlike before when the lump-sum-per-FTD-Month version had
-    no way to attribute to a specific group.
+    source anywhere in the view - it's a flat, genuinely fixed £3,500
+    per Activity Month (not FTD Month - it's a monthly business cost,
+    not an acquisition cost), hardcoded as FIXED_MONTHLY_CHARGE_AMOUNT
+    near the top of this file. Allocated per-account by Combined Stake
+    share - same method as Admin/Platform Fees, but restricted to
+    affiliate accounts only, since this charge is only paid by accounts
+    with an affiliate (see allocate_fixed_monthly_charge()). This also
+    means it's correctly included in the Partner/Campaign/Commission
+    ranking tables, since it's genuinely row-level once allocated.
 
 Deployment: Streamlit Community Cloud. Requires two secrets to be set
 in the app's Settings -> Secrets (see .streamlit/secrets.toml.example
@@ -68,7 +66,12 @@ DB_USER = "postgres.halmyuhieiymqwpddgpp"
 DB_PORT = 5432
 
 SOURCE_VIEW = "Affilka ROI Dash"
-FIXED_CHARGE_TABLE = "Dashboard Fixed Monthly Charge"
+
+# A flat, genuinely fixed cost applied to every Activity Month - no UI
+# to edit this, since it doesn't vary. If this ever needs to change,
+# update the number here directly (and the app will pick it up on its
+# next deploy) rather than via a database-backed editor.
+FIXED_MONTHLY_CHARGE_AMOUNT = 3500.0
 
 _MONTH_ABBR_ORDER = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
 
@@ -165,52 +168,6 @@ def load_combined_stake():
         WHERE "Combined Stake" IS NOT NULL
     '''
     return pd.read_sql(query, conn)
-
-
-@st.cache_data(ttl=600)
-def load_fixed_charges():
-    conn = get_connection()
-    ensure_fixed_charge_table(conn)
-    df = pd.read_sql(f'SELECT "Activity Month", "Amount" FROM "{FIXED_CHARGE_TABLE}"', conn)
-    return dict(zip(df["Activity Month"], df["Amount"]))
-
-
-def ensure_fixed_charge_table(conn):
-    with conn.cursor() as cur:
-        cur.execute(f'''
-            CREATE TABLE IF NOT EXISTS "{FIXED_CHARGE_TABLE}" (
-                "Activity Month" text PRIMARY KEY,
-                "Amount" double precision NOT NULL DEFAULT 0
-            );
-        ''')
-        # Migration: this table was originally keyed by "FTD Month" (a
-        # per-cohort lump sum) before Fixed Monthly Charge was redesigned
-        # to be a per-Activity-Month pool allocated by Combined Stake
-        # share. If an older version of the table exists with that
-        # column, rename it in place rather than losing whatever values
-        # were already entered.
-        cur.execute('''
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = %s
-        ''', (FIXED_CHARGE_TABLE,))
-        existing_columns = {row[0] for row in cur.fetchall()}
-        if "FTD Month" in existing_columns and "Activity Month" not in existing_columns:
-            cur.execute(f'''
-                ALTER TABLE "{FIXED_CHARGE_TABLE}" RENAME COLUMN "FTD Month" TO "Activity Month"
-            ''')
-    conn.commit()
-
-
-def save_fixed_charge(activity_month, amount):
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute(f'''
-            INSERT INTO "{FIXED_CHARGE_TABLE}" ("Activity Month", "Amount")
-            VALUES (%s, %s)
-            ON CONFLICT ("Activity Month") DO UPDATE SET "Amount" = EXCLUDED."Amount"
-        ''', (activity_month, amount))
-    conn.commit()
-    load_fixed_charges.clear()
 
 
 def allocate_fixed_monthly_charge(full_df, combined_stake_df, fixed_charges):
@@ -573,8 +530,12 @@ st.caption(
 
 with st.spinner("Loading data..."):
     df = load_roi_dash_data()
-    fixed_charges = load_fixed_charges()
     combined_stake_df = load_combined_stake()
+
+# Fixed Monthly Charge is a flat, genuinely fixed cost - the same
+# FIXED_MONTHLY_CHARGE_AMOUNT applied to every Activity Month present
+# in the data, no per-month variation and no database table behind it.
+fixed_charges = {m: FIXED_MONTHLY_CHARGE_AMOUNT for m in df["Activity Month"].dropna().unique()}
 
 # Allocate Fixed Monthly Charge on the FULL, unfiltered dataset - see
 # allocate_fixed_monthly_charge()'s docstring for why this must happen
@@ -712,27 +673,26 @@ cohort's lifetime revenue share to date, not just their FTD month.
 
 **Fixed Monthly Charge**
 
-Source: entered manually, per Activity Month, directly in this dashboard;
-allocated using Combined Stake from `Customer Trading Data Monthly`
+Source: a flat, hardcoded £3,500 applied to every Activity Month, allocated
+using Combined Stake from `Customer Trading Data Monthly`
 
 ```
-The pool itself (£X for a given Activity Month) has no source anywhere in
-Affilka or the underlying reports - a genuinely external monthly cost.
+£3,500 has no source anywhere in Affilka or the underlying reports - a
+genuinely external, fixed monthly cost, applied identically to every
+Activity Month (no per-month variation).
 
 Allocated the same way as Admin/Platform Fees, but restricted to affiliate
 accounts only (this charge is only paid by accounts with an affiliate):
 
-each account's share = pool × (that account's Combined Stake that Activity Month
-                                ÷ SUM of Combined Stake across every DISTINCT
-                                  affiliate account active that month)
+each account's share = £3,500 × (that account's Combined Stake that Activity Month
+                                  ÷ SUM of Combined Stake across every DISTINCT
+                                    affiliate account active that month)
 
 then split evenly across however many commission rows that account has
 that specific month, same as everywhere else this pattern is used.
 ```
 
-Stored in Supabase so the pool figure persists across sessions (see
-"Edit Fixed Monthly Charge" below). Summed by FTD Month cohort for
-display here, same as everything else.
+Summed by FTD Month cohort for display here, same as everything else.
 
 ---
 
@@ -772,30 +732,11 @@ for that FTD Month cohort.
         st.subheader(ltv_row)
         st.bar_chart(table.loc[ltv_row, chart_months])
 
-    # ── FIXED MONTHLY CHARGE EDITOR ──
-    st.divider()
-    st.subheader("Edit Fixed Monthly Charge")
     st.caption(
-        "This figure has no source in the data - it's a whole-business monthly cost "
-        "entered manually per Activity Month, then allocated across every affiliate "
-        "account by their share of Combined Stake that month (same method as "
-        "Admin/Platform Fees, but restricted to accounts with an affiliate - see the "
-        "explanation above). Persists here across sessions."
+        f"Fixed Monthly Charge: a flat £{FIXED_MONTHLY_CHARGE_AMOUNT:,.0f} applied to "
+        "every Activity Month, allocated across affiliate accounts by Combined Stake "
+        "share (see the explanation above)."
     )
-
-    activity_months = sorted(df["Activity Month"].dropna().unique(), key=month_sort_key, reverse=True)
-    edit_month = st.selectbox("Activity Month", activity_months, key="fixed_charge_month")
-    current_value = fixed_charges.get(edit_month, 0.0)
-    new_value = st.number_input(
-        f"Fixed Monthly Charge pool for {edit_month} (£)",
-        value=float(current_value),
-        step=100.0,
-    )
-    if st.button("Save"):
-        save_fixed_charge(edit_month, new_value)
-        st.success(f"Saved £{new_value:,.2f} for {edit_month}.")
-        st.rerun()
-
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
 
