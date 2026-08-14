@@ -31,14 +31,18 @@ in a few places - see commit history / conversation for why):
   - "Fixed Monthly Charge" (renamed from the prototype's placeholder
     "Fixed fee" row, which was dummy incrementing test data) has no
     source anywhere in the view - it's a flat, genuinely fixed £3,500
-    per Activity Month (not FTD Month - it's a monthly business cost,
-    not an acquisition cost), hardcoded as FIXED_MONTHLY_CHARGE_AMOUNT
-    near the top of this file. Allocated per-account by Combined Stake
-    share - same method as Admin/Platform Fees, but restricted to
-    affiliate accounts only, since this charge is only paid by accounts
-    with an affiliate (see allocate_fixed_monthly_charge()). This also
-    means it's correctly included in the Partner/Campaign/Commission
-    ranking tables, since it's genuinely row-level once allocated.
+    PER FTD MONTH (hardcoded as FIXED_MONTHLY_CHARGE_AMOUNT near the
+    top of this file), split equally across that month's distinct new
+    FTDs and written onto exactly one row per account (their own
+    FTD-month row - every later Activity Month for that account gets
+    £0). This is genuinely an acquisition cost, paid only in an
+    account's first month, not spread across their whole lifetime
+    activity - see allocate_fixed_monthly_charge(). Same
+    multi-commission-in-one-month double-counting risk already found
+    and fixed once for Spiros_Fixed_Fee is guarded against here the
+    same way (exactly one row per account, picked by lowest Commission
+    ID). Since it's genuinely row-level once allocated, it's correctly
+    included in the Partner/Campaign/Commission ranking tables too.
 
 Deployment: Streamlit Community Cloud. Requires two secrets to be set
 in the app's Settings -> Secrets (see .streamlit/secrets.toml.example
@@ -124,10 +128,9 @@ def load_roi_dash_data():
     upload_gaming_data.py rebuilds it, so this avoids re-querying
     Supabase on every filter change within that window.
 
-    "Original player ID" (the account's own ID - same as "Wallet Code"
-    on "Customer Trading Data Monthly") and "Activity Month" are needed
-    to allocate Fixed Monthly Charge by Combined Stake share - see
-    allocate_fixed_monthly_charge().
+    "Original player ID" (the account's own ID) and "Activity Month"
+    are needed to identify each account's own FTD-month row, for
+    allocating Fixed Monthly Charge - see allocate_fixed_monthly_charge().
     """
     conn = get_connection()
     query = f'''
@@ -150,90 +153,54 @@ def load_roi_dash_data():
     return df
 
 
-@st.cache_data(ttl=600)
-def load_combined_stake():
+def allocate_fixed_monthly_charge(full_df, fixed_charge_amount):
     """
-    Pulls Combined Stake per (Wallet Code, Activity Month) from
-    "Customer Trading Data Monthly" - built for every account by
-    upload_gaming_data.py, affiliate or not. Used as the allocation
-    basis for Fixed Monthly Charge below, restricted to affiliate
-    accounts only (i.e. the ones present in "Affilka ROI Dash") since
-    that charge is only paid by accounts with an affiliate - unlike
-    Admin/Platform Fees, which spans the whole business.
-    """
-    conn = get_connection()
-    query = '''
-        SELECT "Wallet Code", "Activity Month", "Combined Stake"
-        FROM "Customer Trading Data Monthly"
-        WHERE "Combined Stake" IS NOT NULL
-    '''
-    return pd.read_sql(query, conn)
+    Allocates a flat pool (fixed_charge_amount, e.g. £3,500) PER FTD
+    MONTH, split EQUALLY across every distinct account whose FTD Month
+    is that month - i.e. this is genuinely an acquisition cost, paid
+    only in an account's own first month, not spread across their whole
+    lifetime activity. Every OTHER row for that account (any month
+    after their FTD month) gets £0.
 
+    Uses full_df (the FULL, UNFILTERED "Affilka ROI Dash" dataset - not
+    whatever subset the sidebar filters are currently narrowed to) so
+    the £3,500-per-month pool is genuinely split across every real FTD
+    that month, not just whichever subset a filter happens to leave in
+    view. Callers should sum/filter the returned per-row Series AFTER
+    allocation, not before.
 
-def allocate_fixed_monthly_charge(full_df, combined_stake_df, fixed_charges):
-    """
-    Allocates each Activity Month's manually-entered Fixed Monthly
-    Charge pool across every row in full_df (the FULL, UNFILTERED
-    "Affilka ROI Dash" dataset - not whatever subset the sidebar
-    filters are currently narrowed to), by that row's account's own
-    Combined Stake share of the total Combined Stake across every
-    DISTINCT affiliate account active that month.
-
-    Deliberately uses full_df rather than a filtered subset: the true
-    cost-sharing basis is "every affiliate account", so allocating
-    against a filtered-down denominator would make whichever partner is
-    currently selected look like it's absorbing the whole charge, which
-    would be wrong. Callers should sum/filter the returned per-row
-    Series AFTER allocation, not before.
-
-    Same two-step pattern as Admin/Platform Fees: each account's overall
-    share of the pool, then split evenly across however many rows that
-    account has in that specific Activity Month (multiple commissions
-    active simultaneously) - and the same "deduplicate before summing"
-    care taken there, to avoid the double-counting bug already found
-    and fixed twice elsewhere in this project.
-
-    Fully vectorised (map/groupby, no row-wise .apply) - this dataset
-    can be 30k+ rows and gets recomputed on every filter/toggle change,
-    so a Python-level loop over every row would be noticeably slow.
+    Written onto EXACTLY ONE row per account - the one with the lowest
+    Commission ID among their FTD-month rows. An account can have
+    multiple commissions active in their OWN FTD month, and "FTD Count"
+    gets set to 1 on every one of those rows (see
+    sync_monthly_activity_to_supabase.py's own FTD Count logic) - the
+    same double-counting risk already found and fixed once for
+    Spiros_Fixed_Fee, avoided here the same way: pick exactly one row
+    per account, not one row per (account, commission) combination.
 
     Returns a pandas Series aligned with full_df's index - the
     allocated Fixed Monthly Charge for each individual row.
     """
-    merged = full_df.merge(
-        combined_stake_df.rename(columns={"Wallet Code": "Original player ID"}),
-        on=["Original player ID", "Activity Month"],
-        how="left",
-    )
-    merged["Combined Stake"] = merged["Combined Stake"].fillna(0.0)
+    is_ftd_row = full_df["Activity Month"] == full_df["FTD Month"]
+    ftd_rows = full_df[is_ftd_row].copy()
 
-    # Denominator: SUM of Combined Stake per Activity Month, but ONCE
-    # per distinct account - not once per row - since an affiliate
-    # account can have multiple commission rows in the same month.
-    distinct_account_stake = merged.drop_duplicates(subset=["Original player ID", "Activity Month"])
-    month_total_stake = distinct_account_stake.groupby("Activity Month")["Combined Stake"].sum()
+    # Exactly one row per account: lowest Commission ID among their
+    # FTD-month rows, matching the same fix already applied to
+    # Spiros_Fixed_Fee for the identical multi-commission-in-one-month
+    # double-counting risk.
+    ftd_rows = ftd_rows.sort_values("Commission ID")
+    eligible_rows = ftd_rows.drop_duplicates(subset=["Original player ID"], keep="first")
 
-    # Each account's own row count per Activity Month, for splitting
-    # their share evenly across multiple commission rows.
-    account_row_count = merged.groupby(["Original player ID", "Activity Month"]).size()
-    account_row_count.name = "_row_count"
+    # Distinct account count per FTD Month - the true denominator, not
+    # inflated by any account that had multiple commissions in their
+    # own FTD month (already collapsed to one row above).
+    ftd_count_by_month = eligible_rows.groupby("FTD Month").size()
 
-    # Total row count per Activity Month, for the £0-stake fallback.
-    month_row_count = merged.groupby("Activity Month").size()
+    per_account_share = fixed_charge_amount / ftd_count_by_month.replace(0, pd.NA)
+    eligible_rows["_allocated"] = eligible_rows["FTD Month"].map(per_account_share).fillna(0.0)
 
-    merged = merged.join(account_row_count, on=["Original player ID", "Activity Month"])
-    merged["_pool"] = merged["Activity Month"].map(fixed_charges).fillna(0.0)
-    merged["_month_total_stake"] = merged["Activity Month"].map(month_total_stake).fillna(0.0)
-    merged["_month_row_count"] = merged["Activity Month"].map(month_row_count).fillna(1)
-
-    has_stake = merged["_month_total_stake"] > 0
-    account_share = merged["Combined Stake"] / merged["_month_total_stake"].replace(0, pd.NA)
-    proportional_allocation = merged["_pool"] * account_share / merged["_row_count"]
-    equal_split_fallback = merged["_pool"] / merged["_month_row_count"]
-
-    allocated = proportional_allocation.where(has_stake, equal_split_fallback)
-    allocated = allocated.fillna(0.0)
-    allocated.index = full_df.index
+    allocated = pd.Series(0.0, index=full_df.index)
+    allocated.loc[eligible_rows.index] = eligible_rows["_allocated"]
     return allocated
 
 
@@ -416,13 +383,11 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
     Campaign ID, or Commission ID) and computes each group's LIFETIME
     Profit and Player LTV, sorted highest-LTV-first.
 
-    Affiliate Costs here now includes "Allocated Fixed Monthly Charge"
-    (previously excluded, since the old per-FTD-Month lump sum had no
-    way to be attributed to a specific Partner/Campaign/Commission).
-    Now that it's allocated per-row by Combined Stake share (see
-    allocate_fixed_monthly_charge()), summing it by group_col is exactly
-    as valid as summing Casino GGR by group_col - matching Actual_Fixed_Fee
-    and Actual_RS, which were always genuinely row-level in the source view.
+    Affiliate Costs here includes "Allocated Fixed Monthly Charge" -
+    now that it's genuinely row-level (see allocate_fixed_monthly_charge()),
+    summing it by group_col is exactly as valid as summing Casino GGR by
+    group_col - matching Actual_Fixed_Fee and Actual_RS, which were
+    always genuinely row-level in the source view.
 
     Returns a DataFrame with one row per group_col value, sorted by
     Player LTV descending (highest LTV first, matching "top to bottom"
@@ -530,17 +495,11 @@ st.caption(
 
 with st.spinner("Loading data..."):
     df = load_roi_dash_data()
-    combined_stake_df = load_combined_stake()
-
-# Fixed Monthly Charge is a flat, genuinely fixed cost - the same
-# FIXED_MONTHLY_CHARGE_AMOUNT applied to every Activity Month present
-# in the data, no per-month variation and no database table behind it.
-fixed_charges = {m: FIXED_MONTHLY_CHARGE_AMOUNT for m in df["Activity Month"].dropna().unique()}
 
 # Allocate Fixed Monthly Charge on the FULL, unfiltered dataset - see
 # allocate_fixed_monthly_charge()'s docstring for why this must happen
 # before any Partner/Campaign/Commission filtering, not after.
-df["Allocated Fixed Monthly Charge"] = allocate_fixed_monthly_charge(df, combined_stake_df, fixed_charges)
+df["Allocated Fixed Monthly Charge"] = allocate_fixed_monthly_charge(df, FIXED_MONTHLY_CHARGE_AMOUNT)
 
 # ── FILTERS ──────────────────────────────────────────────────────────
 
@@ -673,26 +632,25 @@ cohort's lifetime revenue share to date, not just their FTD month.
 
 **Fixed Monthly Charge**
 
-Source: a flat, hardcoded £3,500 applied to every Activity Month, allocated
-using Combined Stake from `Customer Trading Data Monthly`
+Source: a flat, hardcoded £3,500 per FTD Month, split equally across that
+month's new signups
 
 ```
 £3,500 has no source anywhere in Affilka or the underlying reports - a
-genuinely external, fixed monthly cost, applied identically to every
-Activity Month (no per-month variation).
+genuinely external, fixed acquisition cost, applied per FTD Month (not
+Activity Month - it's paid only in an account's own first month, not
+spread across their whole lifetime activity).
 
-Allocated the same way as Admin/Platform Fees, but restricted to affiliate
-accounts only (this charge is only paid by accounts with an affiliate):
+each account's share = £3,500 ÷ (count of distinct accounts whose
+                                  FTD Month is that same month)
 
-each account's share = £3,500 × (that account's Combined Stake that Activity Month
-                                  ÷ SUM of Combined Stake across every DISTINCT
-                                    affiliate account active that month)
-
-then split evenly across however many commission rows that account has
-that specific month, same as everywhere else this pattern is used.
+written onto exactly one row per account (their own FTD-month row) -
+every other row for that account, in any later Activity Month, is £0.
 ```
 
-Summed by FTD Month cohort for display here, same as everything else.
+Summed by FTD Month cohort for display here, same as everything else -
+which means this row's total for each FTD Month column will sum to
+exactly £3,500 (split however many ways that month had new FTDs).
 
 ---
 
@@ -733,9 +691,8 @@ for that FTD Month cohort.
         st.bar_chart(table.loc[ltv_row, chart_months])
 
     st.caption(
-        f"Fixed Monthly Charge: a flat £{FIXED_MONTHLY_CHARGE_AMOUNT:,.0f} applied to "
-        "every Activity Month, allocated across affiliate accounts by Combined Stake "
-        "share (see the explanation above)."
+        f"Fixed Monthly Charge: a flat £{FIXED_MONTHLY_CHARGE_AMOUNT:,.0f} per FTD Month, "
+        "split equally across that month's new signups (see the explanation above)."
     )
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
@@ -745,9 +702,8 @@ def render_ranking_tab(tab, group_col, label):
         st.subheader(f"Ranked by Player LTV - {label}")
         st.caption(
             "Lifetime totals across every FTD cohort, ranked highest Player LTV first. "
-            "Affiliate Costs includes Fixed Monthly Charge, allocated by each account's "
-            "share of Combined Stake across all affiliate accounts that month, then "
-            "summed here the same way as every other cost."
+            "Affiliate Costs includes Fixed Monthly Charge, split equally across each "
+            "FTD Month's new signups and attributed to their own acquisition month."
         )
         result, profit_label, ltv_label = build_ranking_table(filtered, group_col, include_affiliate_costs)
         display = format_ranking_table(result, profit_label, ltv_label)
