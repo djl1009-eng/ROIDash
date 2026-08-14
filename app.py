@@ -631,7 +631,11 @@ def render_cumulative_chart(df_wide):
         alt.Chart(df_long)
         .mark_line(point=True)
         .encode(
-            x=alt.X("Relative Month:Q", title="Relative Month"),
+            x=alt.X(
+                "Relative Month:Q",
+                title="Relative Month",
+                axis=alt.Axis(tickMinStep=1, format="d"),
+            ),
             y=alt.Y("value:Q", title="", scale=alt.Scale(zero=False)),
             color=alt.Color("FTD Month:N", title="FTD Month"),
             tooltip=["FTD Month", "Relative Month", "value"],
@@ -948,10 +952,15 @@ with tab_cohort:
     # One line per FTD Month cohort, x-axis is Relative Month (1 =
     # the cohort's own FTD month). Uses `filtered` (not the full `df`)
     # so these respect the same Partner/Campaign/Commission sidebar
-    # filters as the table above.
+    # filters as the table above - and is further narrowed to `months`
+    # (the same min_ftd_count-filtered cohort list the table above
+    # uses), so a near-empty/junk cohort with a wildly distorted LTV
+    # (e.g. a single account with FTD Count = 1) doesn't drag the
+    # charts' Y-axis scale away from every other cohort's real values.
     st.divider()
     st.subheader("Cumulative by FTD cohort")
-    relative_month_charts = build_relative_month_series(filtered, include_affiliate_costs)
+    chart_data = filtered[filtered["FTD Month"].isin(months)]
+    relative_month_charts = build_relative_month_series(chart_data, include_affiliate_costs)
 
     chart_pairs = list(relative_month_charts.items())
     for i in range(0, len(chart_pairs), 2):
@@ -975,8 +984,6 @@ def render_ranking_tab(tab, group_col, label):
         result, profit_label, ltv_label = build_ranking_table(filtered, group_col, include_affiliate_costs)
         display = format_ranking_table(result, profit_label, ltv_label)
         st.dataframe(display, use_container_width=True, height=min(35 * len(display) + 80, 700))
-
-        st.bar_chart(result[ltv_label])
 
 
 render_ranking_tab(tab_partner, "Partner ID", "Partner ID")
