@@ -156,6 +156,31 @@ def load_roi_dash_data():
     return df
 
 
+@st.cache_data(ttl=600)
+def load_account_status():
+    """
+    Pulls each account's current status from customer_data - used to
+    count how many accounts in an FTD cohort are now blocked, suspended,
+    or closed (see build_cohort_table()'s "Blocked/Suspended/Closed"
+    row). This is a lifetime, current-state attribute (not month-
+    specific) - customer_data has one row per account, so this is a
+    straight per-account lookup, joined onto "Affilka ROI Dash" by
+    wallet_code = Original player ID.
+
+    NOTE: matched case-insensitively against 'blocked'/'suspended'/
+    'closed' - worth confirming these are genuinely the values used in
+    account_status once this is live, since a mismatch here would
+    silently show £0/zero rather than erroring.
+    """
+    conn = get_connection()
+    query = '''
+        SELECT wallet_code, account_status
+        FROM customer_data
+        WHERE account_status IS NOT NULL
+    '''
+    return pd.read_sql(query, conn)
+
+
 def allocate_fixed_monthly_charge(full_df, fixed_charge_amount):
     """
     Allocates a flat pool (fixed_charge_amount, e.g. £3,500) PER FTD
@@ -274,6 +299,19 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     ftd_count = col_sum("FTD Count")
     deposits = col_sum("Deposits sum")
 
+    # Blocked/suspended/closed count - deduplicated to one row per
+    # account before grouping, since a multi-commission account would
+    # otherwise be counted once per commission row rather than once per
+    # account.
+    distinct_accounts = df.drop_duplicates(subset=["Original player ID", "FTD Month"])
+    blocked_count = (
+        distinct_accounts[distinct_accounts["is_blocked_suspended_closed"]]
+        .groupby("FTD Month")
+        .size()
+        .reindex(months)
+        .fillna(0)
+    )
+
     casino_ggr = col_sum("Casino GGR")
     sb_ggr = col_sum("SB GGR") + col_sum("SB Correction")
     total_ggr = casino_ggr + sb_ggr
@@ -340,7 +378,9 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
 
     # ── Volume ──
     rows["FTD Count"] = ftd_count
+    rows["  Blocked/Suspended/Closed"] = blocked_count
     rows["Deposits"] = deposits
+    sections.append(("FTD Count", ["  Blocked/Suspended/Closed"]))
 
     # ── Revenue ──
     rows["Total GGR"] = total_ggr
@@ -736,7 +776,7 @@ def render_cohort_table_html(table, total_rows, visible_rows):
 
 
 PERCENT_ROWS = {"  Bonus % of GGR"}
-COUNT_ROWS = {"FTD Count"}
+COUNT_ROWS = {"FTD Count", "  Blocked/Suspended/Closed"}
 # Every row not in PERCENT_ROWS or COUNT_ROWS is a currency row -
 # formatting is now driven by exclusion rather than an explicit set,
 # since row labels change dynamically (Profit/LTV's label depends on
@@ -752,6 +792,11 @@ COUNT_ROWS = {"FTD Count"}
 # Stake rather than Affilka's own stake columns).
 ROW_EXPLANATIONS = {
     "FTD Count": "Source: Affilka API\n\nFTD count direct from Affilka.",
+    "  Blocked/Suspended/Closed": (
+        "Source: customer_data (account_status column)\n\n"
+        "Count of distinct accounts in this FTD cohort whose CURRENT account_status "
+        "(as of now, not as of their FTD month) is blocked, suspended, or closed."
+    ),
     "Deposits": "Source: Affilka API\n\nDeposits Sum direct from Affilka.",
     "Total GGR": "Casino GGR + SB GGR (SB GGR already includes SB Correction, so it isn't added again separately here).",
     "  Casino GGR": "Source: Affilka API\n\nCasino GGR direct from Affilka.",
@@ -869,6 +914,17 @@ st.caption(
 
 with st.spinner("Loading data..."):
     df = load_roi_dash_data()
+    account_status_df = load_account_status()
+
+df = df.merge(
+    account_status_df.rename(columns={"wallet_code": "Original player ID"}),
+    on="Original player ID",
+    how="left",
+)
+BLOCKED_STATUSES = {"blocked", "suspended", "closed"}
+df["is_blocked_suspended_closed"] = (
+    df["account_status"].astype(str).str.lower().isin(BLOCKED_STATUSES)
+)
 
 # Allocate Fixed Monthly Charge on the FULL, unfiltered dataset - see
 # allocate_fixed_monthly_charge()'s docstring for why this must happen
