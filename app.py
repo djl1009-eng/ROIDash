@@ -627,6 +627,13 @@ def render_cumulative_chart(df_wide):
     df_long = df_wide.reset_index().melt(
         id_vars="Relative Month", var_name="FTD Month", value_name="value"
     )
+    # Altair sorts a nominal color field alphabetically as strings by
+    # default (e.g. "01/26" before "11/25", since "0" < "1"
+    # lexicographically) - explicitly sorting by the same
+    # month_sort_key() used everywhere else in this app gives the
+    # legend (and matching line/point colors) true chronological order
+    # instead.
+    cohort_order = sorted(df_long["FTD Month"].dropna().unique(), key=month_sort_key)
     chart = (
         alt.Chart(df_long)
         .mark_line(point=True)
@@ -637,7 +644,7 @@ def render_cumulative_chart(df_wide):
                 axis=alt.Axis(tickMinStep=1, format="d"),
             ),
             y=alt.Y("value:Q", title="", scale=alt.Scale(zero=False)),
-            color=alt.Color("FTD Month:N", title="FTD Month"),
+            color=alt.Color("FTD Month:N", title="FTD Month", sort=cohort_order),
             tooltip=["FTD Month", "Relative Month", "value"],
         )
         .properties(height=350)
