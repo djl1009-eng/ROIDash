@@ -337,7 +337,13 @@ if filtered.empty:
 
 table, months = build_cohort_table(filtered, fixed_charges)
 
-display_table = table.copy()
+# .astype(object) first - newer pandas versions raise a TypeError when
+# assigning formatted strings (e.g. "£1,234") into a column pandas still
+# considers float64, rather than silently upcasting like older versions
+# did. Converting the whole table to object dtype upfront means every
+# cell can hold either a number or a string without that strict check
+# kicking in.
+display_table = table.astype(object)
 for row_name in display_table.index:
     if row_name in PERCENT_ROWS:
         display_table.loc[row_name] = table.loc[row_name].apply(format_pct)
