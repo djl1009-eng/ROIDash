@@ -55,6 +55,7 @@ for the exact keys/format):
 
 import streamlit as st
 import pandas as pd
+import altair as alt
 import psycopg2
 from datetime import datetime
 
@@ -613,6 +614,33 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
+def render_cumulative_chart(df_wide):
+    """
+    Renders a wide-format DataFrame (index = Relative Month, one column
+    per FTD Month cohort) as a line chart with an auto-scaling Y-axis -
+    st.line_chart() always forces the Y-axis to start at 0 with no way
+    to override that, which compresses later, higher-value data toward
+    the top of the chart and hides smaller month-to-month movement.
+    Building the chart directly in Altair (alt.Scale(zero=False)) lets
+    the axis scale to the data's actual range instead.
+    """
+    df_long = df_wide.reset_index().melt(
+        id_vars="Relative Month", var_name="FTD Month", value_name="value"
+    )
+    chart = (
+        alt.Chart(df_long)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("Relative Month:Q", title="Relative Month"),
+            y=alt.Y("value:Q", title="", scale=alt.Scale(zero=False)),
+            color=alt.Color("FTD Month:N", title="FTD Month"),
+            tooltip=["FTD Month", "Relative Month", "value"],
+        )
+        .properties(height=350)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 def render_cohort_table_html(table, total_rows, visible_rows):
     """
     Renders the cohort table as a raw HTML <table> via st.markdown,
@@ -931,7 +959,7 @@ with tab_cohort:
         for col, (chart_title, chart_df) in zip(cols, chart_pairs[i:i + 2]):
             with col:
                 st.caption(chart_title)
-                st.line_chart(chart_df)
+                render_cumulative_chart(chart_df)
 
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
