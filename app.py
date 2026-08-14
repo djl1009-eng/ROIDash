@@ -180,16 +180,23 @@ def month_sort_key(mm_yy):
 # ── AGGREGATION ───────────────────────────────────────────────────────
 
 
-def build_cohort_table(df, fixed_charges):
+def build_cohort_table(df, fixed_charges, include_affiliate_costs_in_ltv):
     """
     Groups the (already-filtered) dataframe by FTD Month and computes
-    every row of the cohort report, matching the original prototype's
-    structure - see this module's docstring for the specific formula
-    decisions that differ from the prototype.
+    every row of the cohort report, organised into clear labeled
+    sections (Volume, Revenue, Bonuses, Taxes & Duties, Other Fees,
+    Affiliate Costs, then Profit/LTV last) rather than the original
+    prototype's flat top-to-bottom list. See this module's docstring
+    for the specific formula decisions that differ from the prototype.
+
+    Returns (table, months, total_rows) - total_rows is the set of row
+    labels that are SUMS of other rows in the table (Total GGR, Total
+    Bonus, Total Taxes & Duties, Total Other Fees, Sum of Deductions,
+    Affiliate Costs, Profit, Player LTV), used by the display code to
+    style them distinctly (bold + shaded) from their component rows.
     """
     months = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key, reverse=True)
 
-    rows = {}
     grouped = df.groupby("FTD Month")
 
     def col_sum(col):
@@ -209,10 +216,17 @@ def build_cohort_table(df, fixed_charges):
     total_bonus = free_casino_spins + free_sports_bets + bog_bonus + lucky_bonus
     bonus_pct_of_ggr = (total_bonus / total_ggr.replace(0, pd.NA)).fillna(0)
 
+    # Taxes & Duties - the genuinely regulatory/statutory items, grouped
+    # together per Dave's request (previously scattered among a single
+    # flat "Sum of Deductions" list alongside provider fees etc).
     casino_tax = col_sum("RGD Duty")
     gbd_duty = col_sum("GBD Duty")
     hblb_levy = col_sum("HBLB Levy")
     statutory_levy = col_sum("Statutory Levy")
+    total_taxes_and_duties = casino_tax + gbd_duty + hblb_levy + statutory_levy
+
+    # Other Fees & Adjustments - everything else that used to sit in the
+    # same flat "Sum of Deductions" list, but isn't a tax/duty.
     sportsbook_provider_fees = col_sum("Data Provider Fees")
     casino_provider_fees = (
         col_sum("Casino Provider Fee")
@@ -222,55 +236,94 @@ def build_cohort_table(df, fixed_charges):
     trading_adjustments = col_sum("Trading Adjustments")
     processing_fees = col_sum("Estimated Processing Fees")
     admin_platform_fees = col_sum("Admin/Platform Fees")
-    sum_of_deductions = (
-        casino_tax + gbd_duty + hblb_levy + statutory_levy
-        + sportsbook_provider_fees + casino_provider_fees
+    total_other_fees = (
+        sportsbook_provider_fees + casino_provider_fees
         + trading_adjustments + processing_fees + admin_platform_fees
     )
 
+    sum_of_deductions = total_taxes_and_duties + total_other_fees
+
     fixed_per_player = col_sum("Actual_Fixed_Fee")
     rev_share = col_sum("Actual_RS")
-    fixed_monthly_charge = pd.Series(
-        {m: fixed_charges.get(m, 0.0) for m in months}
-    )
+    fixed_monthly_charge = pd.Series({m: fixed_charges.get(m, 0.0) for m in months})
     vat = (fixed_per_player + rev_share + fixed_monthly_charge) * 0.2
     affiliate_costs = fixed_per_player + rev_share + fixed_monthly_charge + vat
 
-    profit = total_ggr - total_bonus - sum_of_deductions - affiliate_costs
+    # Profit / Player LTV - always the LAST rows in the table. Whether
+    # Affiliate Costs are subtracted depends on the sidebar toggle
+    # (default: excluded) - Profit and LTV move together, since LTV is
+    # just Profit divided by FTD Count, so it wouldn't make sense for
+    # one to include Affiliate Costs and the other not to.
+    if include_affiliate_costs_in_ltv:
+        profit = total_ggr - total_bonus - sum_of_deductions - affiliate_costs
+        profit_label = "Profit (incl. Affiliate Costs)"
+        ltv_label = "Player LTV (incl. Affiliate Costs)"
+    else:
+        profit = total_ggr - total_bonus - sum_of_deductions
+        profit_label = "Profit (excl. Affiliate Costs)"
+        ltv_label = "Player LTV (excl. Affiliate Costs)"
     player_ltv = (profit / ftd_count.replace(0, pd.NA)).fillna(0)
 
+    rows = {}
+    total_rows = set()
+
+    # ── Volume ──
     rows["FTD Count"] = ftd_count
     rows["Deposits"] = deposits
+
+    # ── Revenue ──
     rows["Total GGR"] = total_ggr
+    total_rows.add("Total GGR")
     rows["  Casino GGR"] = casino_ggr
     rows["  SB GGR (incl. correction)"] = sb_ggr
+
+    # ── Bonuses ──
     rows["Total Bonus"] = total_bonus
+    total_rows.add("Total Bonus")
     rows["  Free Casino Spins"] = free_casino_spins
     rows["  Free Sports Bets"] = free_sports_bets
     rows["  BOG Bonus"] = bog_bonus
     rows["  Lucky Bonus"] = lucky_bonus
     rows["Bonus % of GGR"] = bonus_pct_of_ggr
-    rows["Sum of Deductions"] = sum_of_deductions
+
+    # ── Taxes & Duties ──
+    rows["Total Taxes & Duties"] = total_taxes_and_duties
+    total_rows.add("Total Taxes & Duties")
     rows["  Casino Tax (RGD Duty)"] = casino_tax
     rows["  GBD Duty"] = gbd_duty
     rows["  HBLB Levy"] = hblb_levy
     rows["  Statutory Levy"] = statutory_levy
+
+    # ── Other Fees & Adjustments ──
+    rows["Total Other Fees & Adjustments"] = total_other_fees
+    total_rows.add("Total Other Fees & Adjustments")
     rows["  Sportsbook Provider Fees"] = sportsbook_provider_fees
     rows["  Casino Provider Fees"] = casino_provider_fees
     rows["  Trading Adjustments"] = trading_adjustments
     rows["  Processing Fees"] = processing_fees
     rows["  Admin/Platform Fees"] = admin_platform_fees
-    rows["Profit"] = profit
-    rows["Player LTV"] = player_ltv
-    rows["fixed_per_player (FTD Month)"] = fixed_per_player
-    rows["Rev Share (FTD Month)"] = rev_share
-    rows["Fixed Monthly Charge"] = fixed_monthly_charge
-    rows["VAT"] = vat
+
+    # ── Combined deductions total (Taxes & Duties + Other Fees) ──
+    rows["Sum of Deductions"] = sum_of_deductions
+    total_rows.add("Sum of Deductions")
+
+    # ── Affiliate Costs ──
     rows["Affiliate Costs"] = affiliate_costs
+    total_rows.add("Affiliate Costs")
+    rows["  fixed_per_player (FTD Month)"] = fixed_per_player
+    rows["  Rev Share (FTD Month)"] = rev_share
+    rows["  Fixed Monthly Charge"] = fixed_monthly_charge
+    rows["  VAT"] = vat
+
+    # ── Bottom line - always last ──
+    rows[profit_label] = profit
+    total_rows.add(profit_label)
+    rows[ltv_label] = player_ltv
+    total_rows.add(ltv_label)
 
     table = pd.DataFrame(rows).T
     table = table[months]
-    return table, months
+    return table, months, total_rows
 
 
 def format_currency(v):
@@ -285,16 +338,12 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
-CURRENCY_ROWS = {
-    "Deposits", "Total GGR", "  Casino GGR", "  SB GGR (incl. correction)",
-    "Total Bonus", "  Free Casino Spins", "  Free Sports Bets", "  BOG Bonus", "  Lucky Bonus",
-    "Sum of Deductions", "  Casino Tax (RGD Duty)", "  GBD Duty", "  HBLB Levy",
-    "  Statutory Levy", "  Sportsbook Provider Fees", "  Casino Provider Fees",
-    "  Trading Adjustments", "  Processing Fees", "  Admin/Platform Fees",
-    "Profit", "Player LTV", "fixed_per_player (FTD Month)", "Rev Share (FTD Month)",
-    "Fixed Monthly Charge", "VAT", "Affiliate Costs",
-}
 PERCENT_ROWS = {"Bonus % of GGR"}
+COUNT_ROWS = {"FTD Count"}
+# Every row not in PERCENT_ROWS or COUNT_ROWS is a currency row -
+# formatting is now driven by exclusion rather than an explicit set,
+# since row labels change dynamically (Profit/LTV's label depends on
+# the affiliate-costs toggle).
 
 
 # ── MAIN APP ──────────────────────────────────────────────────────────
@@ -321,6 +370,18 @@ selected_partners = st.sidebar.multiselect("Partner ID", partner_ids)
 selected_campaigns = st.sidebar.multiselect("Campaign ID", campaign_ids)
 selected_commissions = st.sidebar.multiselect("Commission ID", commission_ids)
 
+st.sidebar.divider()
+include_affiliate_costs = st.sidebar.checkbox(
+    "Include Affiliate Costs in Profit / Player LTV",
+    value=False,
+    help=(
+        "Off by default: Profit and Player LTV show core unit economics "
+        "(revenue minus bonuses and deductions) before affiliate acquisition "
+        "cost. Turn on to see the fully-loaded figure after Affiliate Costs "
+        "as well."
+    ),
+)
+
 filtered = df.copy()
 if selected_partners:
     filtered = filtered[filtered["Partner ID"].isin(selected_partners)]
@@ -335,7 +396,7 @@ if filtered.empty:
 
 # ── COHORT TABLE ─────────────────────────────────────────────────────
 
-table, months = build_cohort_table(filtered, fixed_charges)
+table, months, total_rows = build_cohort_table(filtered, fixed_charges, include_affiliate_costs)
 
 # .astype(object) first - newer pandas versions raise a TypeError when
 # assigning formatted strings (e.g. "£1,234") into a column pandas still
@@ -347,23 +408,41 @@ display_table = table.astype(object)
 for row_name in display_table.index:
     if row_name in PERCENT_ROWS:
         display_table.loc[row_name] = table.loc[row_name].apply(format_pct)
-    elif row_name in CURRENCY_ROWS:
-        display_table.loc[row_name] = table.loc[row_name].apply(format_currency)
-    else:
+    elif row_name in COUNT_ROWS:
         display_table.loc[row_name] = table.loc[row_name].apply(lambda v: f"{v:,.0f}")
+    else:
+        display_table.loc[row_name] = table.loc[row_name].apply(format_currency)
 
-st.dataframe(display_table, use_container_width=True, height=min(35 * len(display_table) + 40, 900))
+
+def style_total_rows(row):
+    """
+    Bold + shaded background for total/subtotal rows (Total GGR, Total
+    Bonus, Total Taxes & Duties, Total Other Fees & Adjustments, Sum of
+    Deductions, Affiliate Costs, Profit, Player LTV) so it's visually
+    obvious at a glance which rows are sums of the detail rows sitting
+    underneath them, versus the individual line items themselves.
+    """
+    if row.name in total_rows:
+        return ["font-weight: bold; background-color: rgba(120, 120, 120, 0.18)"] * len(row)
+    return [""] * len(row)
+
+
+styled_table = display_table.style.apply(style_total_rows, axis=1)
+st.dataframe(styled_table, use_container_width=True, height=min(35 * len(display_table) + 40, 900))
 
 # ── PROFIT / LTV CHARTS ──────────────────────────────────────────────
+
+profit_row = next(r for r in table.index if r.startswith("Profit"))
+ltv_row = next(r for r in table.index if r.startswith("Player LTV"))
 
 col1, col2 = st.columns(2)
 chart_months = list(reversed(months))  # chronological for charts
 with col1:
-    st.subheader("Profit by FTD cohort")
-    st.bar_chart(table.loc["Profit", chart_months])
+    st.subheader(profit_row)
+    st.bar_chart(table.loc[profit_row, chart_months])
 with col2:
-    st.subheader("Player LTV by FTD cohort")
-    st.bar_chart(table.loc["Player LTV", chart_months])
+    st.subheader(ltv_row)
+    st.bar_chart(table.loc[ltv_row, chart_months])
 
 # ── FIXED MONTHLY CHARGE EDITOR ──────────────────────────────────────
 
