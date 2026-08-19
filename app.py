@@ -176,26 +176,57 @@ def load_roi_dash_data():
     allocating Fixed Monthly Charge - see allocate_fixed_monthly_charge().
     "Relative Month" and "Deposits count" feed the cumulative-by-cohort
     charts - see build_relative_month_series().
+
+    Extends the statement timeout to 45s for this specific query (well
+    above whatever short default the pooled connection uses) - unlike
+    load_account_status(), this query is core to the whole dashboard,
+    so a failure here can't just degrade gracefully to an empty result.
+    Instead, a clear, actionable message is shown (rather than a raw
+    Streamlit crash traceback) if it still fails - this exact error
+    class (QueryCanceled / 57014) has previously been traced to
+    Supabase-side resource contention on this project (confirmed by
+    Supabase support), so that's the most likely cause if this
+    recurs, not a bug in this query itself.
     """
     conn = get_healthy_connection()
-    query = f'''
-        SELECT
-            "FTD Month", "Activity Month", "Original player ID", "Relative Month",
-            "Partner ID", "Campaign ID", "Commission ID",
-            "FTD Count", "Deposits sum", "Deposits count",
-            "Casino GGR", "SB GGR", "SB Correction",
-            "Casino Bonus", "SB Bonus",
-            "Free Spins Payout", "Free Bet Payout", "BOG Bonus", "Lucky Bonus",
-            "RGD Duty", "GBD Duty", "HBLB Levy", "Statutory Levy",
-            "Data Provider Fees",
-            "Casino Provider Fee", "Live Casino Provider Fee", "Virtuals Provider Fee",
-            "Trading Adjustments", "Estimated Processing Fees", "Admin/Platform Fees",
-            "Actual_Fixed_Fee", "Actual_RS"
-        FROM "{SOURCE_VIEW}"
-        WHERE "FTD Month" IS NOT NULL
-    '''
-    df = pd.read_sql(query, conn)
-    return df
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            SELECT
+                "FTD Month", "Activity Month", "Original player ID", "Relative Month",
+                "Partner ID", "Campaign ID", "Commission ID",
+                "FTD Count", "Deposits sum", "Deposits count",
+                "Casino GGR", "SB GGR", "SB Correction",
+                "Casino Bonus", "SB Bonus",
+                "Free Spins Payout", "Free Bet Payout", "BOG Bonus", "Lucky Bonus",
+                "RGD Duty", "GBD Duty", "HBLB Levy", "Statutory Levy",
+                "Data Provider Fees",
+                "Casino Provider Fee", "Live Casino Provider Fee", "Virtuals Provider Fee",
+                "Trading Adjustments", "Estimated Processing Fees", "Admin/Platform Fees",
+                "Actual_Fixed_Fee", "Actual_RS"
+            FROM "{SOURCE_VIEW}"
+            WHERE "FTD Month" IS NOT NULL
+        '''
+        df = pd.read_sql(query, conn)
+        return df
+    except Exception as e:
+        st.error(
+            f"Couldn't load data from \"{SOURCE_VIEW}\" ({e}).\n\n"
+            "This has previously been caused by Supabase-side resource "
+            "contention on this project (confirmed by Supabase support) "
+            "rather than a bug in the dashboard itself. If this keeps "
+            "happening:\n\n"
+            "1. Check the Supabase dashboard - if the database shows as "
+            "unresponsive or unhealthy, try restarting the project from "
+            "Project Settings.\n"
+            "2. If it recurs frequently, the underlying compute tier may "
+            "need upgrading - see the guidance Supabase support provided "
+            "previously.\n\n"
+            "Refreshing this page will retry once the underlying issue is "
+            "resolved."
+        )
+        st.stop()
 
 
 @st.cache_data(ttl=600)
