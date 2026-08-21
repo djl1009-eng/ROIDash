@@ -574,6 +574,24 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
         .reset_index(name="players_depositing")
     )
 
+    # % of Players Still Depositing - each cohort's own Relative Month 1
+    # depositing count as the 100% baseline (their own FTD month, when
+    # by definition every FTD-ing account deposited), every later
+    # relative month expressed as a % of that same cohort's own
+    # baseline. NOT a % of the whole business or of FTD Count - purely
+    # relative to that cohort's own starting depositing population, so
+    # cohorts of very different sizes are still comparable on the same
+    # 0-100% scale.
+    baseline_by_cohort = (
+        depositing[depositing["Relative Month"] == 1]
+        .set_index("FTD Month")["players_depositing"]
+    )
+    depositing_pct = depositing.copy()
+    depositing_pct["baseline"] = depositing_pct["FTD Month"].map(baseline_by_cohort)
+    depositing_pct["pct_still_depositing"] = (
+        100 * depositing_pct["players_depositing"] / depositing_pct["baseline"].replace(0, pd.NA)
+    ).fillna(0)
+
     def pivot_metric(source_df, value_col):
         return source_df.pivot(index="Relative Month", columns="FTD Month", values=value_col).sort_index()
 
@@ -584,6 +602,7 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
         "Cumulative Deposits": pivot_metric(per_period, "cum_deposits"),
         "Cumulative Player LTV": pivot_metric(per_period, "cum_player_ltv"),
         "Count of Players Depositing": pivot_metric(depositing, "players_depositing").fillna(0),
+        "% of Players Still Depositing": pivot_metric(depositing_pct, "pct_still_depositing").fillna(0),
     }
 
 
@@ -687,7 +706,7 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
-def render_cumulative_chart(df_wide):
+def render_cumulative_chart(df_wide, is_percent=False):
     """
     Renders a wide-format DataFrame (index = Relative Month, one column
     per FTD Month cohort) as a line chart with an auto-scaling Y-axis -
@@ -696,6 +715,12 @@ def render_cumulative_chart(df_wide):
     the top of the chart and hides smaller month-to-month movement.
     Building the chart directly in Altair (alt.Scale(zero=False)) lets
     the axis scale to the data's actual range instead.
+
+    is_percent=True formats the Y-axis with a "%" suffix (values are
+    already expected to be on a 0-100 scale, not 0-1) and keeps the
+    axis anchored at zero - unlike the currency charts, 0-100% is a
+    natural, meaningful bound worth keeping visible rather than
+    auto-scaling away.
     """
     df_long = df_wide.reset_index().melt(
         id_vars="Relative Month", var_name="FTD Month", value_name="value"
@@ -707,6 +732,12 @@ def render_cumulative_chart(df_wide):
     # legend (and matching line/point colors) true chronological order
     # instead.
     cohort_order = sorted(df_long["FTD Month"].dropna().unique(), key=month_sort_key)
+    y_axis = alt.Y(
+        "value:Q",
+        title="% still depositing" if is_percent else "",
+        scale=alt.Scale(zero=True) if is_percent else alt.Scale(zero=False),
+        axis=alt.Axis(format=".0f") if is_percent else alt.Axis(),
+    )
     chart = (
         alt.Chart(df_long)
         .mark_line(point=True)
@@ -716,7 +747,7 @@ def render_cumulative_chart(df_wide):
                 title="Relative Month",
                 axis=alt.Axis(tickMinStep=1, format="d"),
             ),
-            y=alt.Y("value:Q", title="", scale=alt.Scale(zero=False)),
+            y=y_axis,
             color=alt.Color("FTD Month:N", title="FTD Month", sort=cohort_order),
             tooltip=["FTD Month", "Relative Month", "value"],
         )
@@ -986,6 +1017,21 @@ min_ftd_count = st.sidebar.number_input(
     ),
 )
 
+st.sidebar.divider()
+exclude_outlier_accounts = st.sidebar.checkbox(
+    "Exclude top 5% and bottom 5% of accounts by Total GGR",
+    value=False,
+    help=(
+        "Removes every row belonging to an account whose LIFETIME Total GGR "
+        "(summed across all their rows, within whatever Partner/Campaign/"
+        "Commission filter is currently applied) falls in the top or bottom "
+        "5% of accounts. Removing an account removes ALL of its figures - "
+        "GGR, bonuses, taxes, fees, affiliate costs - not just its GGR "
+        "contribution, since every one of those is computed per-row and "
+        "summed."
+    ),
+)
+
 filtered = df.copy()
 if selected_partners:
     filtered = filtered[filtered["Partner ID"].isin(selected_partners)]
@@ -993,6 +1039,28 @@ if selected_campaigns:
     filtered = filtered[filtered["Campaign ID"].isin(selected_campaigns)]
 if selected_commissions:
     filtered = filtered[filtered["Commission ID"].isin(selected_commissions)]
+
+if exclude_outlier_accounts and not filtered.empty:
+    # Total GGR per row, same formula used everywhere else in this app
+    # (Casino GGR + SB GGR, which already includes SB Correction).
+    row_total_ggr = filtered["Casino GGR"] + filtered["SB GGR"] + filtered["SB Correction"]
+    account_lifetime_ggr = (
+        pd.Series(row_total_ggr.values, index=filtered["Original player ID"])
+        .groupby(level=0)
+        .sum()
+    )
+    lower_threshold = account_lifetime_ggr.quantile(0.05)
+    upper_threshold = account_lifetime_ggr.quantile(0.95)
+    excluded_accounts = account_lifetime_ggr[
+        (account_lifetime_ggr <= lower_threshold) | (account_lifetime_ggr >= upper_threshold)
+    ].index
+
+    before_count = filtered["Original player ID"].nunique()
+    filtered = filtered[~filtered["Original player ID"].isin(excluded_accounts)]
+    st.sidebar.caption(
+        f"Excluded {len(excluded_accounts):,} of {before_count:,} accounts "
+        f"(Total GGR outside £{lower_threshold:,.0f}-£{upper_threshold:,.0f})."
+    )
 
 if filtered.empty:
     st.warning("No data matches the selected filters.")
@@ -1048,7 +1116,7 @@ with tab_cohort:
         for col, (chart_title, chart_df) in zip(cols, chart_pairs[i:i + 2]):
             with col:
                 st.caption(chart_title)
-                render_cumulative_chart(chart_df)
+                render_cumulative_chart(chart_df, is_percent=(chart_title == "% of Players Still Depositing"))
 
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
