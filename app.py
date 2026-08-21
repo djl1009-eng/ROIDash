@@ -602,7 +602,15 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
         "Cumulative Deposits": pivot_metric(per_period, "cum_deposits"),
         "Cumulative Player LTV": pivot_metric(per_period, "cum_player_ltv"),
         "Count of Players Depositing": pivot_metric(depositing, "players_depositing").fillna(0),
-        "% of Players Still Depositing": pivot_metric(depositing_pct, "pct_still_depositing").fillna(0),
+        # No .fillna(0) here, unlike every other chart's pivot - a
+        # missing (Relative Month, FTD Month) combination genuinely
+        # means that calendar month hasn't happened yet for that
+        # cohort (e.g. an 08/26 FTD cohort has no 09/26 data at all
+        # while it's still August), not that retention dropped to 0%.
+        # Left as NaN, Altair breaks the line there instead of drawing
+        # a misleading 0% point or interpolating across the gap - see
+        # render_cumulative_chart().
+        "% of Players Still Depositing": pivot_metric(depositing_pct, "pct_still_depositing"),
     }
 
 
