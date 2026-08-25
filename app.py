@@ -92,6 +92,14 @@ _MONTH_ABBR_ORDER = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10",
 
 RELATIVE_DAY_WINDOW = 30
 
+# The timezone every timestamp is reduced to before its calendar date is
+# taken. This is not cosmetic: "First deposit date" is timestamptz, so
+# an FTD at 00:30 BST is the PREVIOUS day in UTC, which would shift that
+# account a full day on every relative-day calculation and move accounts
+# between cohorts at month boundaries. UK book, so London is the
+# meaningful day boundary.
+LOCAL_TIMEZONE = "Europe/London"
+
 # Minimum number of still-observable accounts a (cohort, day) point
 # needs before it's plotted at all. Below this, one account flipping
 # from active to lapsed moves the line by 20+ percentage points, which
@@ -736,6 +744,46 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     }
 
 
+def to_local_naive_date(series):
+    """
+    Reduces a timestamp column to a tz-naive calendar date in
+    LOCAL_TIMEZONE, whatever it arrives as.
+
+    Needed because the two timestamps feeding the retention chart come
+    from different places and don't agree on tz-awareness: the view's
+    "First deposit date" is timestamptz, while customer_data's
+    last_successful_deposit lands naive. pandas refuses to compare or
+    subtract across that boundary (TypeError: Invalid comparison between
+    dtype=datetime64[ns, UTC] and Timestamp) rather than guessing, which
+    is the right call - the two interpretations are a day apart for
+    anything near midnight.
+
+    Rules applied here:
+      - tz-AWARE input is converted to LOCAL_TIMEZONE before the date is
+        taken, so an FTD at 00:30 BST counts as that day rather than the
+        one before.
+      - tz-NAIVE input is assumed to ALREADY be local wall-clock time
+        (it comes from Drive CSV exports of a UK-facing system) and is
+        left where it is. Localising it to UTC first and converting
+        would shift it by an hour in summer, in the wrong direction.
+      - mixed UTC offsets in one column (which a London-local column
+        spanning a DST change will have) make pandas RAISE
+        "Mixed timezones detected" rather than return something usable,
+        so that's caught and re-parsed via UTC. Verified by test rather
+        than assumed - an earlier version of this checked the returned
+        dtype instead, and the check was unreachable.
+    """
+    try:
+        parsed = pd.to_datetime(series, errors="coerce")
+    except ValueError:
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    if not pd.api.types.is_datetime64_any_dtype(parsed):
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+        parsed = parsed.dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
+    return parsed.dt.normalize()
+
+
 def build_relative_day_retention(
     lifecycle_df,
     cohort_months=None,
@@ -817,8 +865,13 @@ def build_relative_day_retention(
     if d.empty:
         return empty
 
-    d["ftd_date"] = pd.to_datetime(d["ftd_at"], errors="coerce").dt.normalize()
-    d["last_date"] = pd.to_datetime(d["last_deposit_at"], errors="coerce").dt.normalize()
+    # Both reduced to tz-naive local calendar dates before anything is
+    # compared or subtracted - see to_local_naive_date(). The two
+    # columns come from different sources and disagree on tz-awareness,
+    # which pandas treats as an error rather than silently picking an
+    # interpretation.
+    d["ftd_date"] = to_local_naive_date(d["ftd_at"])
+    d["last_date"] = to_local_naive_date(d["last_deposit_at"])
     d = d.dropna(subset=["ftd_date"])
 
     # No recorded last deposit -> removed entirely, so these accounts
