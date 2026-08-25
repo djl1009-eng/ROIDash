@@ -99,20 +99,24 @@ RELATIVE_DAY_WINDOW = 30
 # Same intent as the sidebar's min_ftd_count, applied per-point.
 MIN_OBSERVED_ACCOUNTS_PER_POINT = 5
 
-# CONFIRM THIS BEFORE DEPLOYING. customer_data is merged on wallet_code
-# (see merge_reports.py / UploadCustomerData.py), while the ROI dash
-# keys on "Original player ID". If those aren't the same identifier in
-# your warehouse, this join silently returns all-NULL last-deposit dates
-# and every account gets excluded - which looks like a data problem
-# upstream rather than a config error here. Sanity check: the exclusion
-# caption rendered under the chart.
+# The 30-day chart sources its FTD timestamps from SOURCE_VIEW rather
+# than the underlying "Affilka Data" table, so "Original player ID" is
+# literally the same column here as in load_roi_dash_data() - the chart
+# can't drift out of alignment with the sidebar filters it's scoped by.
+# Per the view definition, that column is "Affilka Data"."Account ID"
+# surfaced under a different name.
+#
+# That leaves customer_data as the only join with any uncertainty in it,
+# and not much: the view itself already joins "Customer Trading Data
+# Monthly" on "Wallet Code" = "Account ID", so wallet_code and
+# "Original player ID" are the same identifier. Both sides are still
+# cast to text, since "Account ID" is bigint and wallet_code may be
+# text - Postgres would otherwise refuse the comparison outright.
+#
+# A wrong key here fails visibly rather than silently: every account
+# ends up with a NULL last deposit and gets excluded, which the caption
+# under the chart reports.
 CUSTOMER_DATA_JOIN_KEY = "wallet_code"
-
-# Likewise confirm the FTD source table name and column. This assumes
-# "Affilka Data" holds first_deposit_processed_at, at commission-row
-# granularity (hence the MIN + GROUP BY to collapse to one row per
-# account, taking the EARLIEST across an account's commissions).
-AFFILKA_SOURCE_TABLE = "Affilka Data"
 
 
 # ── PASSWORD GATE ────────────────────────────────────────────────────
@@ -269,11 +273,18 @@ def load_deposit_lifecycle_data():
     One row per account: when they made their first deposit, and when
     they last made one. Feeds the 30-day retention chart only.
 
+    FTD timestamps come from SOURCE_VIEW rather than the underlying
+    "Affilka Data" table, so "Original player ID" is the identical
+    column to the one load_roi_dash_data() returns - the chart is scoped
+    by that ID against the sidebar-filtered frame, and sourcing both
+    from the same place removes any chance of the two drifting apart.
+
     Deliberately a separate query from load_roi_dash_data() rather than
-    extra columns on it - the ROI dash view is at (account, activity
-    month, commission) granularity, and both of these timestamps are
+    extra columns on it. Two reasons: the view is at (account, activity
+    month, commission) grain and both of these timestamps are
     account-level facts that would repeat across every one of an
-    account's rows.
+    account's rows; and keeping it separate is what lets a failure here
+    degrade to a missing chart instead of taking the dashboard down.
 
     Cached for 10 minutes to match load_roi_dash_data(), and uses the
     same extended statement timeout and get_healthy_connection() for the
@@ -288,20 +299,27 @@ def load_deposit_lifecycle_data():
             cur.execute("SET statement_timeout = '45000'")  # milliseconds
         query = f'''
             WITH ftd AS (
-                -- MIN() is the point of this CTE, not incidental: an
-                -- account with several Commission IDs has a
-                -- first_deposit_processed_at on each of its rows, and
-                -- the EARLIEST of those is the account's real FTD.
+                -- MIN() is the point of this CTE, not incidental: the
+                -- view is at (account, Activity Month, Commission ID)
+                -- grain, each row carrying "First deposit date", and the
+                -- EARLIEST of those is the account's real FTD.
                 -- Collapsing to one row per account here also stops the
                 -- join below fanning out and counting the account once
-                -- per commission in every denominator - the same
+                -- per commission-month in every denominator - the same
                 -- multi-commission double-counting already found and
                 -- fixed for Spiros_Fixed_Fee and Fixed Monthly Charge.
+                --
+                -- "Original player ID" is nullable upstream (it is
+                -- "Affilka Data"."Account ID" surfaced under another
+                -- name), and SQL would otherwise collapse every NULL
+                -- into a single phantom account, so those rows are
+                -- excluded outright.
                 SELECT
                     "Original player ID" AS player_id,
-                    MIN("first_deposit_processed_at") AS ftd_at
-                FROM "{AFFILKA_SOURCE_TABLE}"
-                WHERE "first_deposit_processed_at" IS NOT NULL
+                    MIN("First deposit date") AS ftd_at
+                FROM "{SOURCE_VIEW}"
+                WHERE "First deposit date" IS NOT NULL
+                  AND "Original player ID" IS NOT NULL
                 GROUP BY 1
             ),
             last_dep AS (
@@ -310,7 +328,7 @@ def load_deposit_lifecycle_data():
                 -- would silently double-weight those accounts in every
                 -- percentage rather than erroring.
                 SELECT
-                    "{CUSTOMER_DATA_JOIN_KEY}" AS player_id,
+                    "{CUSTOMER_DATA_JOIN_KEY}"::text AS customer_key,
                     MAX("last_successful_deposit") AS last_deposit_at
                 FROM "customer_data"
                 GROUP BY 1
@@ -321,7 +339,7 @@ def load_deposit_lifecycle_data():
                 l.last_deposit_at
             FROM ftd f
             LEFT JOIN last_dep l
-                   ON l.player_id = f.player_id
+                   ON l.customer_key = f.player_id::text
         '''
         return pd.read_sql(query, conn)
     except Exception as e:
