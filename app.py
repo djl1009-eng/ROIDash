@@ -1022,7 +1022,7 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
-def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month", y_title=None):
+def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month", y_title=None, x_zero=True):
     """
     Renders a wide-format DataFrame (index = x_field, one column per FTD
     Month cohort) as a line chart with an auto-scaling Y-axis -
@@ -1040,6 +1040,12 @@ def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month",
 
     x_field names the index column, so the same renderer handles both
     the "Relative Month" series and the "Relative Day" retention chart.
+
+    x_zero=False drops the 0 tick from the x-axis. Every series here
+    starts at period 1, so a 0 tick is dead space that shifts the first
+    real data point away from the axis. Defaults to True purely to keep
+    the existing monthly charts looking as they always have - flip the
+    call sites if you want them consistent with the daily one.
     """
     df_long = df_wide.reset_index().melt(
         id_vars=x_field, var_name="FTD Month", value_name="value"
@@ -1066,6 +1072,7 @@ def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month",
             x=alt.X(
                 f"{x_field}:Q",
                 title=x_field,
+                scale=alt.Scale(zero=x_zero),
                 axis=alt.Axis(tickMinStep=1, format="d"),
             ),
             y=y_axis,
@@ -1432,34 +1439,20 @@ with tab_cohort:
     relative_month_charts = build_relative_month_series(chart_data, include_affiliate_costs)
 
     chart_pairs = list(relative_month_charts.items())
-    for i in range(0, len(chart_pairs), 2):
-        cols = st.columns(2)
-        for col, (chart_title, chart_df) in zip(cols, chart_pairs[i:i + 2]):
-            with col:
-                st.caption(chart_title)
-                render_cumulative_chart(chart_df, is_percent=(chart_title == "% of Players Still Depositing"))
 
     # ── 30 DAYS % OF PLAYERS STILL DEPOSITING ──
-    # Fed by its own query (account-level FTD + last deposit
-    # timestamps), not by the ROI dash view - see
+    # Appended to the same grid as the monthly charts rather than given
+    # its own section, but fed by its own query (account-level FTD +
+    # last deposit timestamps) rather than by the ROI dash view - see
     # load_deposit_lifecycle_data() and build_relative_day_retention().
-    st.divider()
-    st.subheader(f"{RELATIVE_DAY_WINDOW} Days % of Players Still Depositing")
-    st.caption(
-        "Share of each FTD cohort whose LAST successful deposit falls on or after "
-        "that relative day (day 1 = the account's own FTD day). This is a survival "
-        "curve, not a per-day activity snapshot: an account whose last deposit is "
-        "day 25 counts on every day up to 25, including days it didn't deposit. "
-        "Each day only counts accounts that have actually had that many days since "
-        "their own FTD, so young cohorts stop rather than falling away. Accounts "
-        "with no recorded last successful deposit are excluded."
-    )
+    # Everything below is guarded so that a failure, a missing table or
+    # a bad join key drops this one panel from the grid and leaves the
+    # other six untouched.
+    DAY_CHART_TITLE = f"{RELATIVE_DAY_WINDOW} Days % of Players Still Depositing"
+    day_chart_note = None
 
     lifecycle = load_deposit_lifecycle_data()
-
-    if lifecycle.empty:
-        st.info("No deposit lifecycle data available.")
-    else:
+    if not lifecycle.empty:
         # Restricting by player_id against `filtered` makes this chart
         # respect every sidebar control - Partner/Campaign/Commission and
         # the outlier exclusion - without reimplementing any of that
@@ -1474,7 +1467,7 @@ with tab_cohort:
         lifecycle_scoped = lifecycle[lifecycle["player_id"].astype(str).isin(filtered_ids)]
 
         if lifecycle_scoped.empty:
-            st.info(
+            day_chart_note = (
                 "No accounts matched between the ROI dash and the deposit "
                 f"lifecycle query - check that customer_data.{CUSTOMER_DATA_JOIN_KEY} "
                 "is the same identifier as \"Original player ID\"."
@@ -1488,17 +1481,33 @@ with tab_cohort:
             n_matched = len(lifecycle_scoped)
             n_no_last_deposit = int(lifecycle_scoped["last_deposit_at"].isna().sum())
             if n_no_last_deposit:
-                st.caption(
+                day_chart_note = (
                     f"Excluded {n_no_last_deposit:,} of {n_matched:,} accounts with no "
                     "recorded last successful deposit."
                 )
+            chart_pairs.append((
+                DAY_CHART_TITLE,
+                build_relative_day_retention(lifecycle_scoped, cohort_months=months),
+            ))
 
-            day_retention = build_relative_day_retention(
-                lifecycle_scoped, cohort_months=months
-            )
-            render_cumulative_chart(
-                day_retention, is_percent=True, x_field="Relative Day"
-            )
+    for i in range(0, len(chart_pairs), 2):
+        cols = st.columns(2)
+        for col, (chart_title, chart_df) in zip(cols, chart_pairs[i:i + 2]):
+            with col:
+                st.caption(chart_title)
+                is_day_chart = chart_title == DAY_CHART_TITLE
+                render_cumulative_chart(
+                    chart_df,
+                    is_percent=is_day_chart or chart_title == "% of Players Still Depositing",
+                    x_field="Relative Day" if is_day_chart else "Relative Month",
+                    # Only the daily chart drops the 0 tick, so the
+                    # monthly charts keep the look they already had. Set
+                    # this to False unconditionally if you'd rather all
+                    # seven axes started at 1.
+                    x_zero=not is_day_chart,
+                )
+                if is_day_chart and day_chart_note:
+                    st.caption(day_chart_note)
 
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
