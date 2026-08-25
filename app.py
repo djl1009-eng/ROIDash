@@ -612,6 +612,14 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     x-axis is Relative Month (1 = the cohort's own FTD month, 2 = the
     month after, etc.).
 
+    The four value series (Total GGR, Casino GGR, Sports GGR, Deposits)
+    are all PER PLAYER - each cohort's cumulative total divided by its
+    own FTD Count, the same basis Cumulative Player LTV uses. They're
+    still cumulative; the division removes cohort SIZE from the
+    comparison so a small month and a large month sit on the same scale.
+    Raw cumulative totals are still computed (cum_total_ggr and friends)
+    and can be surfaced by pointing the returned dict back at them.
+
     "Count of Players Depositing" is the one NON-cumulative metric here
     - a retention-style snapshot of how many distinct accounts in that
     cohort made at least one deposit specifically in that relative
@@ -695,6 +703,27 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     per_period["ftd_count"] = per_period["FTD Month"].map(ftd_count_by_cohort)
     per_period["cum_player_ltv"] = (per_period["cum_profit"] / per_period["ftd_count"].replace(0, pd.NA)).fillna(0)
 
+    # Per-player versions of the four value series, on the same basis
+    # Cumulative Player LTV already used: a cohort's running total to
+    # date divided by its own FTD Count. Still cumulative - the division
+    # only removes cohort SIZE from the comparison, so a 40-FTD month
+    # and a 400-FTD month sit on the same scale and the lines say
+    # something about player quality rather than about how much was
+    # spent acquiring that month.
+    #
+    # FTD Count is fixed per cohort (it doesn't vary by relative month),
+    # so this is a division by a constant within each line - the shape
+    # of every curve is unchanged, only its height.
+    for cumulative_col, per_player_col in [
+        ("cum_total_ggr", "cum_total_ggr_pp"),
+        ("cum_casino_ggr", "cum_casino_ggr_pp"),
+        ("cum_sports_ggr", "cum_sports_ggr_pp"),
+        ("cum_deposits", "cum_deposits_pp"),
+    ]:
+        per_period[per_player_col] = (
+            per_period[cumulative_col] / per_period["ftd_count"].replace(0, pd.NA)
+        ).fillna(0)
+
     # Count of Players Depositing - NOT cumulative, distinct accounts
     # with at least one deposit specifically in that relative month.
     depositing = (
@@ -726,10 +755,10 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
         return source_df.pivot(index="Relative Month", columns="FTD Month", values=value_col).sort_index()
 
     return {
-        "Cumulative Total GGR": pivot_metric(per_period, "cum_total_ggr"),
-        "Cumulative Casino GGR": pivot_metric(per_period, "cum_casino_ggr"),
-        "Cumulative Sports GGR": pivot_metric(per_period, "cum_sports_ggr"),
-        "Cumulative Deposits": pivot_metric(per_period, "cum_deposits"),
+        "Cumulative Total GGR per Player": pivot_metric(per_period, "cum_total_ggr_pp"),
+        "Cumulative Casino GGR per Player": pivot_metric(per_period, "cum_casino_ggr_pp"),
+        "Cumulative Sports GGR per Player": pivot_metric(per_period, "cum_sports_ggr_pp"),
+        "Cumulative Deposits per Player": pivot_metric(per_period, "cum_deposits_pp"),
         "Cumulative Player LTV": pivot_metric(per_period, "cum_player_ltv"),
         "Count of Players Depositing": pivot_metric(depositing, "players_depositing").fillna(0),
         # No .fillna(0) here, unlike every other chart's pivot - a
