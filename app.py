@@ -359,6 +359,47 @@ def load_deposit_lifecycle_data():
         return pd.DataFrame(columns=["player_id", "ftd_at", "last_deposit_at"])
 
 
+@st.cache_data(ttl=600)
+def load_account_status_data():
+    """
+    One row per account: its current account_status from customer_data,
+    used to break the FTD Count row down by status.
+
+    Like last_successful_deposit, this is a LIVE snapshot column - an
+    account that was active last month and is closed today shows as
+    closed in every cohort it appears in. The breakdown therefore
+    describes those cohorts as they stand now, not as they were during
+    the month they were acquired.
+
+    MAX() picks one value deterministically if customer_data ever holds
+    more than one row per key, for the same reason the deposit lifecycle
+    query aggregates: an un-aggregated join would fan out and inflate
+    every count rather than erroring.
+
+    A failure here degrades to no breakdown at all - the FTD Count row
+    stays a plain row with nothing to expand - rather than taking the
+    dashboard down.
+    """
+    conn = get_healthy_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            SELECT
+                "{CUSTOMER_DATA_JOIN_KEY}"::text AS player_key,
+                MAX("account_status") AS account_status
+            FROM "customer_data"
+            GROUP BY 1
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.warning(
+            f"Couldn't load account statuses ({e}) - the FTD Count row won't "
+            "have a status breakdown. The rest of the dashboard is unaffected."
+        )
+        return pd.DataFrame(columns=["player_key", "account_status"])
+
+
 def allocate_fixed_monthly_charge(full_df, fixed_charge_amount):
     """
     Allocates a flat pool (fixed_charge_amount, e.g. £3,500) PER FTD
@@ -423,6 +464,48 @@ def month_sort_key(mm_yy):
 
 
 # ── AGGREGATION ───────────────────────────────────────────────────────
+
+
+# ── ACCOUNT STATUS BREAKDOWN (FTD Count detail rows) ─────────────────
+
+# Maps the lowercased, trimmed customer_data.account_status value to its
+# display row. Anything not listed lands in OTHER_STATUS_LABEL rather
+# than being dropped, so the detail rows always sum to the FTD Count row
+# above them - a status nobody anticipated shows up as a visible bucket
+# instead of a silent shortfall.
+ACCOUNT_STATUS_BUCKETS = {
+    "active": "  Active",
+    "suspended": "  Suspended",
+    "closed": "  Closed",
+    "blocked": "  Blocked",
+}
+NO_STATUS_LABEL = "  No status recorded"
+OTHER_STATUS_LABEL = "  Other status"
+ACCOUNT_STATUS_ROW_ORDER = list(ACCOUNT_STATUS_BUCKETS.values()) + [
+    NO_STATUS_LABEL,
+    OTHER_STATUS_LABEL,
+]
+
+
+def bucket_account_status(series):
+    """
+    Normalises a raw account_status column to display row labels.
+
+    NULL, NaN and whitespace-only values all become NO_STATUS_LABEL -
+    "" and NULL mean the same thing here, and treating them separately
+    would split one real bucket across two rows. Matching is done on the
+    lowercased, trimmed value so "Active", "active " and "ACTIVE" don't
+    become three different statuses.
+    """
+    def to_label(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return NO_STATUS_LABEL
+        text = str(value).strip().lower()
+        if not text or text in {"nan", "none", "null"}:
+            return NO_STATUS_LABEL
+        return ACCOUNT_STATUS_BUCKETS.get(text, OTHER_STATUS_LABEL)
+
+    return series.map(to_label)
 
 
 def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
@@ -543,6 +626,46 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
 
     # ── Volume ──
     rows["FTD Count"] = ftd_count
+
+    # FTD Count detail rows, present only if the Account Status column
+    # was attached upstream (it isn't if the status query failed).
+    #
+    # These sum the SAME "FTD Count" column the parent row does, just
+    # partitioned by status, rather than counting distinct accounts.
+    # That matters: "FTD Count" is 1 on EVERY one of an account's
+    # FTD-month commission rows (see allocate_fixed_monthly_charge()),
+    # so a distinct-account breakdown would not add up to the parent
+    # row. Partitioning the parent's own rows makes the details
+    # reconcile by construction, whatever the parent does.
+    if "Account Status" in df.columns:
+        status_buckets = bucket_account_status(df["Account Status"])
+        status_counts = (
+            df.assign(_status_bucket=status_buckets)
+            .groupby(["_status_bucket", "FTD Month"])["FTD Count"]
+            .sum()
+            .unstack(fill_value=0)
+            .reindex(columns=months, fill_value=0)
+        )
+        status_detail_rows = []
+        for label in ACCOUNT_STATUS_ROW_ORDER:
+            series = status_counts.loc[label] if label in status_counts.index else None
+            # "Other status" is clutter when nothing falls into it, but
+            # the four named statuses stay visible at zero - a cohort
+            # with no closed accounts is a real and useful reading,
+            # whereas an empty Other bucket says nothing.
+            if series is None:
+                if label == OTHER_STATUS_LABEL:
+                    continue
+                series = pd.Series(0, index=months)
+            elif label == OTHER_STATUS_LABEL and not series.any():
+                continue
+            rows[label] = series.reindex(months).fillna(0)
+            status_detail_rows.append(label)
+
+        if status_detail_rows:
+            total_rows.add("FTD Count")
+            sections.append(("FTD Count", status_detail_rows))
+
     rows["Deposits"] = deposits
 
     # ── Revenue ──
@@ -1208,7 +1331,7 @@ def render_cohort_table_html(table, total_rows, visible_rows):
 
 
 PERCENT_ROWS = {"  Bonus % of GGR"}
-COUNT_ROWS = {"FTD Count"}
+COUNT_ROWS = {"FTD Count"} | set(ACCOUNT_STATUS_ROW_ORDER)
 # Every row not in PERCENT_ROWS or COUNT_ROWS is a currency row -
 # formatting is now driven by exclusion rather than an explicit set,
 # since row labels change dynamically (Profit/LTV's label depends on
@@ -1224,6 +1347,37 @@ COUNT_ROWS = {"FTD Count"}
 # Stake rather than Affilka's own stake columns).
 ROW_EXPLANATIONS = {
     "FTD Count": "Source: Affilka API\n\nFTD count direct from Affilka.",
+    "  Active": (
+        "Source: customer_data.account_status\n\n"
+        "The same FTD Count figure as the row above, split by each account's "
+        "account_status AS IT STANDS NOW - not as it was during the month the "
+        "cohort was acquired. account_status is a live snapshot column, so an "
+        "account acquired in Nov-25 and closed last week counts as closed here."
+    ),
+    "  Suspended": (
+        "Source: customer_data.account_status\n\n"
+        "See Active - same basis, current status rather than status at acquisition."
+    ),
+    "  Closed": (
+        "Source: customer_data.account_status\n\n"
+        "See Active - same basis, current status rather than status at acquisition."
+    ),
+    "  Blocked": (
+        "Source: customer_data.account_status\n\n"
+        "See Active - same basis, current status rather than status at acquisition."
+    ),
+    "  No status recorded": (
+        "Source: customer_data.account_status\n\n"
+        "Accounts with no account_status in customer_data, or with a blank one - "
+        "NULL and empty string are the same thing here and share this row. Also "
+        "where accounts land if they have no customer_data row at all."
+    ),
+    "  Other status": (
+        "Source: customer_data.account_status\n\n"
+        "An account_status value that isn't one of the four expected ones. This "
+        "row is hidden when empty, so if it's showing, customer_data holds a "
+        "status worth adding to ACCOUNT_STATUS_BUCKETS."
+    ),
     "Deposits": "Source: Affilka API\n\nDeposits Sum direct from Affilka.",
     "Total GGR": "Casino GGR + SB GGR (SB GGR already includes SB Correction, so it isn't added again separately here).",
     "  Casino GGR": "Source: Affilka API\n\nCasino GGR direct from Affilka.",
@@ -1346,6 +1500,29 @@ with st.spinner("Loading data..."):
 # allocate_fixed_monthly_charge()'s docstring for why this must happen
 # before any Partner/Campaign/Commission filtering, not after.
 df["Allocated Fixed Monthly Charge"] = allocate_fixed_monthly_charge(df, FIXED_MONTHLY_CHARGE_AMOUNT)
+
+# Attach account_status so build_cohort_table() can break FTD Count down
+# by it. Attached to the FULL frame before filtering, so the column
+# survives into `filtered` without needing to be re-joined.
+#
+# The match-rate guard matters: if the join key ever stops working,
+# every account maps to NaN and the whole cohort silently reports as
+# "No status recorded", which reads as a genuine finding about the book
+# rather than as a broken join. Dropping the column entirely in that
+# case makes the failure visible as a missing breakdown instead.
+account_status = load_account_status_data()
+if not account_status.empty:
+    status_by_key = account_status.dropna(subset=["player_key"]).set_index("player_key")["account_status"]
+    mapped_status = df["Original player ID"].astype(str).map(status_by_key)
+    if mapped_status.notna().any():
+        df["Account Status"] = mapped_status
+    else:
+        st.warning(
+            "No accounts matched customer_data on "
+            f"{CUSTOMER_DATA_JOIN_KEY}, so the FTD Count status breakdown is "
+            "unavailable - check that it's the same identifier as "
+            "\"Original player ID\"."
+        )
 
 # ── FILTERS ──────────────────────────────────────────────────────────
 
