@@ -422,23 +422,64 @@ def load_account_status_data():
         return pd.DataFrame(columns=["player_key", "account_status"])
 
 
+PARTNER_ID_HEADER = "partner id"
+PARTNER_NAME_HEADER = "partner name"
+
+
+def cell_text(value):
+    """
+    A spreadsheet cell as a trimmed string, with blanks as "".
+
+    Written in plain Python rather than as .astype(str).str.strip()
+    because .astype(str) NO LONGER turns NaN into the string "nan" in
+    current pandas - it leaves a float NaN in place, and the next .isdigit()
+    on it raises AttributeError. This sheet has blank spacer rows, so
+    that path is hit every single load. Doing the conversion here makes
+    the result independent of which pandas string-dtype behaviour is in
+    effect on the deployment.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none"} else text
+
+
 @st.cache_data(ttl=3600)
 def load_partner_names():
     """
-    Returns a dict of {partner_id_as_str: partner_name} from the sheet,
-    or an empty dict if it can't be read.
+    Returns (mapping, note) where mapping is {partner_id_as_str: name}
+    and note is a short string to show the user (or None).
+
+    The note is RETURNED rather than rendered here because this function
+    is cached: st.* calls inside a cached function only run on a cache
+    miss, so a warning written here would appear once and then silently
+    vanish on every later rerun - exactly when it's still true.
 
     Cached for an hour rather than the 10 minutes the database queries
     use - a partner list changes when someone signs a new affiliate, not
     every few minutes, and this is the one load that reaches outside
     Supabase.
 
-    Columns are taken BY POSITION (A and B) rather than by header name,
-    since the headers aren't guaranteed and a renamed header shouldn't
-    silently break the mapping. If the value in the header cell of
-    column A parses as a number, the sheet has no header row and the
-    first partner would otherwise be swallowed as a column name, so it's
-    re-read with header=None.
+    Reading strategy, and why it isn't just read_csv with default args:
+      - headers=0 tells gviz to treat EVERY row as data. Left to itself
+        it guesses a header row, and this sheet's row 1 is a merged
+        month banner rather than headers, so its guess is wrong.
+      - The real header row is then FOUND by scanning for a cell reading
+        "Partner ID", instead of assuming a fixed row number. Rows get
+        inserted above headers in a working spreadsheet, and a fixed
+        offset would break silently the first time that happens.
+      - Column positions come from that header row too, so the mapping
+        survives someone inserting a column before Partner Name.
+      - Only rows whose ID is all digits are kept, which drops the blank
+        spacer rows and the "NON AFF TOTAL" style subtotal lines without
+        needing to know what they say.
+
+    Duplicate Partner IDs keep the FIRST name in sheet order and the
+    count is reported in the note. The sheet does contain them, so this
+    needs a stated rule rather than whichever row happens to be written
+    last - and first-in-sheet-order is at least stable and inspectable.
 
     Every ID is keyed as a STRING. Partner ID is bigint in Postgres and
     may arrive from the sheet as either int or text, and a dtype
@@ -446,38 +487,78 @@ def load_partner_names():
     """
     url = (
         f"https://docs.google.com/spreadsheets/d/{PARTNER_NAMES_SHEET_ID}"
-        f"/gviz/tq?tqx=out:csv&sheet={PARTNER_NAMES_SHEET_TAB}"
+        f"/gviz/tq?tqx=out:csv&headers=0&sheet={PARTNER_NAMES_SHEET_TAB}"
     )
     try:
-        sheet = pd.read_csv(url, dtype=str)
-        if sheet.shape[1] >= 1:
-            first_header = str(sheet.columns[0]).strip()
-            if first_header.replace(".", "", 1).isdigit():
-                sheet = pd.read_csv(url, dtype=str, header=None)
-        if sheet.shape[1] < 2:
-            st.sidebar.caption(
-                f"Partner name sheet tab '{PARTNER_NAMES_SHEET_TAB}' has fewer "
-                "than two columns - showing Partner IDs."
-            )
-            return {}
-
-        ids = sheet.iloc[:, 0].astype(str).str.strip()
-        names = sheet.iloc[:, 1].astype(str).str.strip()
-        mapping = {
-            i: n for i, n in zip(ids, names)
-            if i and i.lower() not in {"nan", "none"} and n and n.lower() not in {"nan", "none"}
-        }
-        return mapping
+        raw = pd.read_csv(url, dtype=str, header=None)
     except Exception as e:
         # Most likely cause by a wide margin is the sheet not being
         # link-shared, in which case Google serves a sign-in page and
-        # the CSV parse fails on HTML.
-        st.sidebar.caption(
-            f"Couldn't read partner names ({type(e).__name__}) - showing Partner "
-            "IDs instead. Check the sheet is shared as 'Anyone with the link' "
+        # the CSV parse chokes on HTML. The exception text is included
+        # because the type alone was not enough to diagnose this last
+        # time.
+        return {}, (
+            f"Couldn't read partner names ({type(e).__name__}: {e}) - showing "
+            "Partner IDs. Check the sheet is shared as 'Anyone with the link' "
             f"and that a tab named '{PARTNER_NAMES_SHEET_TAB}' exists."
         )
-        return {}
+
+    if raw.empty or raw.shape[1] < 2:
+        return {}, (
+            f"Tab '{PARTNER_NAMES_SHEET_TAB}' has fewer than two columns - "
+            "showing Partner IDs."
+        )
+
+    # Locate the header row and the two columns within it.
+    id_col, name_col, header_idx = 0, 1, -1
+    for i in range(min(len(raw), 30)):
+        cells = [cell_text(v).lower() for v in raw.iloc[i]]
+        if PARTNER_ID_HEADER in cells:
+            header_idx = i
+            id_col = cells.index(PARTNER_ID_HEADER)
+            name_col = (
+                cells.index(PARTNER_NAME_HEADER)
+                if PARTNER_NAME_HEADER in cells
+                else id_col + 1
+            )
+            break
+
+    # header_idx == -1 means no header was found; fall back to columns A
+    # and B over the whole sheet. The all-digits filter below makes that
+    # safe - a stray header row simply fails to match and is skipped.
+    body = raw.iloc[header_idx + 1:] if header_idx >= 0 else raw
+    if name_col >= raw.shape[1]:
+        return {}, (
+            f"Couldn't find a 'Partner Name' column in tab "
+            f"'{PARTNER_NAMES_SHEET_TAB}' - showing Partner IDs."
+        )
+
+    ids = [cell_text(v) for v in body.iloc[:, id_col]]
+    names = [cell_text(v) for v in body.iloc[:, name_col]]
+
+    mapping, duplicates = {}, 0
+    for partner_id, name in zip(ids, names):
+        if not partner_id.isdigit() or not name:
+            continue
+        if partner_id in mapping:
+            if mapping[partner_id] != name:
+                duplicates += 1
+            continue
+        mapping[partner_id] = name
+
+    if not mapping:
+        return {}, (
+            f"No Partner ID / Partner Name pairs found in tab "
+            f"'{PARTNER_NAMES_SHEET_TAB}' - showing Partner IDs."
+        )
+
+    note = None
+    if duplicates:
+        note = (
+            f"{duplicates:,} Partner ID(s) appear more than once in the sheet "
+            "with different names - using the first of each."
+        )
+    return mapping, note
 
 
 def partner_display_name(partner_id, partner_names):
@@ -1711,7 +1792,9 @@ partner_ids = sorted(df["Partner ID"].dropna().unique().tolist())
 campaign_ids = sorted(df["Campaign ID"].dropna().unique().tolist())
 commission_ids = sorted(df["Commission ID"].dropna().unique().tolist())
 
-partner_names = load_partner_names()
+partner_names, partner_names_note = load_partner_names()
+if partner_names_note:
+    st.sidebar.caption(partner_names_note)
 
 # format_func shows the name but the widget's VALUES stay Partner IDs,
 # so every downstream filter still compares IDs against the dataframe -
