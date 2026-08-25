@@ -129,6 +129,23 @@ LOCAL_TIMEZONE = "Europe/London"
 # Same intent as the sidebar's min_ftd_count, applied per-point.
 MIN_OBSERVED_ACCOUNTS_PER_POINT = 5
 
+# The fraction of a cohort that must still be observable at a given
+# relative day for that point to be plotted.
+#
+# Without this, a cohort's line keeps going long after the denominator
+# has stopped being the cohort and become a small, early-signing slice
+# of it: on 25 Aug, day 25 of the 08/26 cohort is answerable ONLY by
+# accounts that signed up on 1 Aug. Each step right then swaps in a
+# different population rather than following one forward, and the line
+# can RISE - which on a survival curve reads as accounts coming back
+# from the dead when nothing of the sort happened.
+#
+# At 0.9, a fully mature cohort (every account past 30 days) keeps all
+# thirty points, since its coverage is 100% throughout. A cohort still
+# inside its own window stops early - the current month typically after
+# a few days - which is the honest length for it.
+MIN_COHORT_COVERAGE_PER_POINT = 0.9
+
 # The 30-day chart sources its FTD timestamps from SOURCE_VIEW rather
 # than the underlying "Affilka Data" table, so "Original player ID" is
 # literally the same column here as in load_roi_dash_data() - the chart
@@ -476,10 +493,12 @@ def load_partner_names():
         spacer rows and the "NON AFF TOTAL" style subtotal lines without
         needing to know what they say.
 
-    Duplicate Partner IDs keep the FIRST name in sheet order and the
-    count is reported in the note. The sheet does contain them, so this
-    needs a stated rule rather than whichever row happens to be written
-    last - and first-in-sheet-order is at least stable and inspectable.
+    Duplicate Partner IDs keep the FIRST name in sheet order. The sheet
+    does contain them, so this needs a stated rule rather than whichever
+    row happens to be written last - first-in-sheet-order is stable and
+    inspectable. Deliberately silent: it's a standing property of the
+    sheet, not a per-load problem. The note is reserved for failures
+    that leave the mapping unusable.
 
     Every ID is keyed as a STRING. Partner ID is bigint in Postgres and
     may arrive from the sheet as either int or text, and a dtype
@@ -536,15 +555,14 @@ def load_partner_names():
     ids = [cell_text(v) for v in body.iloc[:, id_col]]
     names = [cell_text(v) for v in body.iloc[:, name_col]]
 
-    mapping, duplicates = {}, 0
+    # Duplicate Partner IDs keep the FIRST name in sheet order. Not
+    # surfaced to the user - it's a known, accepted property of the
+    # sheet rather than something to act on each time the app loads.
+    mapping = {}
     for partner_id, name in zip(ids, names):
         if not partner_id.isdigit() or not name:
             continue
-        if partner_id in mapping:
-            if mapping[partner_id] != name:
-                duplicates += 1
-            continue
-        mapping[partner_id] = name
+        mapping.setdefault(partner_id, name)
 
     if not mapping:
         return {}, (
@@ -552,13 +570,7 @@ def load_partner_names():
             f"'{PARTNER_NAMES_SHEET_TAB}' - showing Partner IDs."
         )
 
-    note = None
-    if duplicates:
-        note = (
-            f"{duplicates:,} Partner ID(s) appear more than once in the sheet "
-            "with different names - using the first of each."
-        )
-    return mapping, note
+    return mapping, None
 
 
 def partner_display_name(partner_id, partner_names):
@@ -1125,6 +1137,7 @@ def build_relative_day_retention(
     cohort_months=None,
     window=RELATIVE_DAY_WINDOW,
     min_observed=MIN_OBSERVED_ACCOUNTS_PER_POINT,
+    min_coverage=MIN_COHORT_COVERAGE_PER_POINT,
     as_of=None,
 ):
     """
@@ -1166,10 +1179,16 @@ def build_relative_day_retention(
     identical to real churn. This is the day-level equivalent of the
     NaN-not-zero handling in build_relative_month_series().
 
-    A consequence worth knowing: the denominator shrinks as N grows for
-    any cohort still inside its own 30-day window, so those tails are
-    built on fewer accounts. min_observed suppresses the points where
-    that gets too thin.
+    That per-day denominator has a cost, which min_coverage exists to
+    contain: as N grows, the eligible set for a cohort still inside its
+    own window shrinks toward the accounts that signed up EARLIEST in
+    the month. Each step right then swaps in a different population
+    rather than following one forward, and the line can rise - reading
+    as accounts returning when none did. A point is therefore dropped
+    unless at least min_coverage of the cohort is still observable, so
+    every plotted point describes substantially the whole cohort.
+    min_observed drops points for the separate reason of being too few
+    accounts to be stable at all.
 
     Accounts with no recorded last_successful_deposit are DROPPED, not
     counted. Two consequences to keep in mind: every cohort's
@@ -1243,10 +1262,18 @@ def build_relative_day_retention(
     for month, cohort in d.groupby("FTD Month"):
         observed = cohort["days_observed"].to_numpy()
         last_day = cohort["last_relative_day"].to_numpy()
+        cohort_size = len(cohort)
         for day in range(1, window + 1):
             eligible = observed >= day
             n_eligible = int(eligible.sum())
-            if n_eligible < min_observed:
+            coverage = n_eligible / cohort_size if cohort_size else 0.0
+            # Two independent reasons to drop a point: too few accounts
+            # left to be stable (min_observed), or too small a SHARE of
+            # the cohort left for the point to still describe that
+            # cohort rather than an early-signing slice of it
+            # (min_coverage). The second is what stops a partial
+            # cohort's line rising - see MIN_COHORT_COVERAGE_PER_POINT.
+            if n_eligible < min_observed or coverage < min_coverage:
                 pct = float("nan")
             else:
                 still = int((last_day[eligible] >= day).sum())
@@ -2046,6 +2073,18 @@ with tab_cohort:
                     is_percent=is_day_chart or chart_title == "% of Players Still Depositing",
                     x_field="Relative Day" if is_day_chart else "Relative Month",
                 )
+                if is_day_chart:
+                    st.caption(
+                        f"Each line stops once fewer than "
+                        f"{MIN_COHORT_COVERAGE_PER_POINT:.0%} of that cohort has been "
+                        "around long enough to reach that day. A cohort still inside "
+                        "its own 30-day window can only answer for later days using "
+                        "its earliest signups — day 25 of the current month is "
+                        "answerable only by accounts that joined on the 1st — so "
+                        "carrying the line further would compare a different, "
+                        "shrinking group at each point and could make it rise, which "
+                        "on a survival curve would look like lapsed players returning."
+                    )
                 if is_day_chart and day_chart_note:
                     st.caption(day_chart_note)
 
