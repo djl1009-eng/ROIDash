@@ -1022,7 +1022,7 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
-def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month", y_title=None, x_zero=True):
+def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month", y_title=None, x_zero=False):
     """
     Renders a wide-format DataFrame (index = x_field, one column per FTD
     Month cohort) as a line chart with an auto-scaling Y-axis -
@@ -1041,11 +1041,12 @@ def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month",
     x_field names the index column, so the same renderer handles both
     the "Relative Month" series and the "Relative Day" retention chart.
 
-    x_zero=False drops the 0 tick from the x-axis. Every series here
-    starts at period 1, so a 0 tick is dead space that shifts the first
-    real data point away from the axis. Defaults to True purely to keep
-    the existing monthly charts looking as they always have - flip the
-    call sites if you want them consistent with the daily one.
+    Every series here starts at period 1, so the x-axis is pinned to the
+    data's own first and last period. zero=False alone is NOT enough to
+    achieve that: Vega-Lite's "nice" rounding is on by default and will
+    happily extend a 1-30 domain down to 0 to land on a round number,
+    which is what put the 0 tick there in the first place. nice=False
+    plus an explicit domain is what actually removes it.
     """
     df_long = df_wide.reset_index().melt(
         id_vars=x_field, var_name="FTD Month", value_name="value"
@@ -1065,6 +1066,16 @@ def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month",
         scale=alt.Scale(zero=True) if is_percent else alt.Scale(zero=False),
         axis=alt.Axis(format=".0f") if is_percent else alt.Axis(),
     )
+    # Pinned to the data's own range, with nice=False, so the axis
+    # starts at period 1 rather than being rounded down to 0. Guarded
+    # for an empty frame, where min()/max() would be NaN.
+    x_values = pd.to_numeric(df_long[x_field], errors="coerce").dropna()
+    if x_zero or x_values.empty:
+        x_scale = alt.Scale(zero=x_zero)
+    else:
+        x_scale = alt.Scale(
+            zero=False, nice=False, domain=[float(x_values.min()), float(x_values.max())]
+        )
     chart = (
         alt.Chart(df_long)
         .mark_line(point=True)
@@ -1072,7 +1083,7 @@ def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month",
             x=alt.X(
                 f"{x_field}:Q",
                 title=x_field,
-                scale=alt.Scale(zero=x_zero),
+                scale=x_scale,
                 axis=alt.Axis(tickMinStep=1, format="d"),
             ),
             y=y_axis,
@@ -1500,11 +1511,6 @@ with tab_cohort:
                     chart_df,
                     is_percent=is_day_chart or chart_title == "% of Players Still Depositing",
                     x_field="Relative Day" if is_day_chart else "Relative Month",
-                    # Only the daily chart drops the 0 tick, so the
-                    # monthly charts keep the look they already had. Set
-                    # this to False unconditionally if you'd rather all
-                    # seven axes started at 1.
-                    x_zero=not is_day_chart,
                 )
                 if is_day_chart and day_chart_note:
                     st.caption(day_chart_note)
