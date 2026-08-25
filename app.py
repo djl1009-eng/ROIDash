@@ -90,6 +90,11 @@ _MONTH_ABBR_ORDER = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10",
 
 # ── 30-DAY RETENTION CHART CONFIG ─────────────────────────────────────
 
+# How many of the most recent FTD-month cohorts "ARPU after N months"
+# excludes, so the metric only reflects cohorts that have had time to
+# earn out. Changing this renames the ranking-table column too.
+ARPU_MATURITY_MONTHS = 3
+
 RELATIVE_DAY_WINDOW = 30
 
 # The timezone every timestamp is reduced to before its calendar date is
@@ -1082,21 +1087,19 @@ def build_relative_day_retention(
     return wide.reindex(range(1, window + 1)).sort_index()
 
 
-def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
+def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv):
     """
-    Groups the (already-filtered) dataframe by group_col (Partner ID,
-    Campaign ID, or Commission ID) and computes each group's LIFETIME
-    Profit and Player LTV, sorted highest-LTV-first.
+    Per-group sums of every component the ranking tables need, plus the
+    resulting Profit. Factored out so the lifetime columns and the
+    ARPU-after-3-months column are computed by the SAME code on two
+    different slices of data - if the profit formula ever changes, it
+    can't drift between the two.
 
     Affiliate Costs here includes "Allocated Fixed Monthly Charge" -
     now that it's genuinely row-level (see allocate_fixed_monthly_charge()),
     summing it by group_col is exactly as valid as summing Casino GGR by
     group_col - matching Actual_Fixed_Fee and Actual_RS, which were
     always genuinely row-level in the source view.
-
-    Returns a DataFrame with one row per group_col value, sorted by
-    Player LTV descending (highest LTV first, matching "top to bottom"
-    ranking).
     """
     grouped = df.groupby(group_col)
 
@@ -1132,39 +1135,117 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
 
     if include_affiliate_costs_in_ltv:
         profit = total_ggr - total_bonus - sum_of_deductions - affiliate_costs
-        profit_label = "Profit (incl. Affiliate Costs)"
-        ltv_label = "Player LTV (incl. Affiliate Costs)"
     else:
         profit = total_ggr - total_bonus - sum_of_deductions
+
+    return {
+        "ftd_count": ftd_count,
+        "total_ggr": total_ggr,
+        "total_bonus": total_bonus,
+        "sum_of_deductions": sum_of_deductions,
+        "affiliate_costs": affiliate_costs,
+        "profit": profit,
+    }
+
+
+def immature_ftd_months(df, maturity_months=ARPU_MATURITY_MONTHS):
+    """
+    The N most recent FTD Month cohorts in the dataset - the ones too
+    young to have had time to earn out, which ARPU after N months
+    excludes.
+
+    Computed from the FULL dataset rather than from whatever the sidebar
+    filters currently leave in view, so every partner is judged against
+    the same calendar cutoff. Deriving it from the filtered frame would
+    mean a partner whose newest cohort is 03/26 gets 12/25-03/26 cut
+    while a partner still acquiring gets 06/26-08/26 cut - different
+    maturity windows, and the resulting ARPUs wouldn't be comparable,
+    which is the entire point of a ranking table.
+    """
+    months = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key, reverse=True)
+    return set(months[:maturity_months])
+
+
+def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, excluded_ftd_months=frozenset()):
+    """
+    Groups the (already-filtered) dataframe by group_col (Partner ID,
+    Campaign ID, or Commission ID) and computes each group's LIFETIME
+    totals, plus ARPU after N months, sorted highest-ARPU-first.
+
+    ARPU after N months is each group's Profit divided by its FTD Count
+    with the N most recent FTD-month cohorts REMOVED FROM BOTH. Those
+    cohorts are counted in the denominator the moment they sign up but
+    have barely started contributing to the numerator, so including them
+    drags down whichever partner is currently acquiring hardest - which
+    is precisely backwards for a table meant to rank partner quality.
+    Removing them from both sides puts every group on cohorts that have
+    had at least N months to earn out.
+
+    NOTE the other columns are still LIFETIME figures across every
+    cohort, so ARPU deliberately does NOT equal this table's own Profit
+    divided by its own FTD Count. That's the point - they answer
+    different questions - but it's why the tab carries a caption saying
+    so.
+
+    A group whose every cohort is inside the excluded window has no
+    mature FTDs at all, and gets NaN rather than 0 - a genuine "not
+    measurable yet", displayed as n/a and sorted last, not a zero that
+    would read as a group that earned nothing.
+
+    Returns (result, profit_label, arpu_label).
+    """
+    lifetime = summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv)
+
+    mature_df = df[~df["FTD Month"].isin(excluded_ftd_months)]
+    if mature_df.empty:
+        arpu = pd.Series(float("nan"), index=lifetime["ftd_count"].index)
+    else:
+        mature = summarise_group_economics(mature_df, group_col, include_affiliate_costs_in_ltv)
+        mature_ftds = mature["ftd_count"].replace(0, pd.NA)
+        arpu = (mature["profit"] / mature_ftds).reindex(lifetime["ftd_count"].index)
+        arpu = pd.to_numeric(arpu, errors="coerce")
+
+    if include_affiliate_costs_in_ltv:
+        profit_label = "Profit (incl. Affiliate Costs)"
+        arpu_label = f"ARPU after {ARPU_MATURITY_MONTHS} months (incl. Affiliate Costs)"
+    else:
         profit_label = "Profit (excl. Affiliate Costs)"
-        ltv_label = "Player LTV (excl. Affiliate Costs)"
-    player_ltv = (profit / ftd_count.replace(0, pd.NA)).fillna(0)
+        arpu_label = f"ARPU after {ARPU_MATURITY_MONTHS} months (excl. Affiliate Costs)"
 
     result = pd.DataFrame({
-        "FTD Count": ftd_count,
-        "Total GGR": total_ggr,
-        "Total Bonus": total_bonus,
-        "Sum of Deductions": sum_of_deductions,
-        "Affiliate Costs": affiliate_costs,
-        profit_label: profit,
-        ltv_label: player_ltv,
+        "FTD Count": lifetime["ftd_count"],
+        "Total GGR": lifetime["total_ggr"],
+        "Total Bonus": lifetime["total_bonus"],
+        "Sum of Deductions": lifetime["sum_of_deductions"],
+        "Affiliate Costs": lifetime["affiliate_costs"],
+        profit_label: lifetime["profit"],
+        arpu_label: arpu,
     })
-    result = result.sort_values(ltv_label, ascending=False)
+    result = result.sort_values(arpu_label, ascending=False, na_position="last")
     result.index.name = group_col
-    return result, profit_label, ltv_label
+    return result, profit_label, arpu_label
 
 
-def format_ranking_table(result, profit_label, ltv_label):
+def format_ranking_table(result, profit_label, arpu_label):
     """
     Currency-formats every column except FTD Count (a plain integer
     count), returning a display-ready copy. Same .astype(object)
     upfront pattern as the cohort table, for the same reason (newer
     pandas rejects writing formatted strings into a float64 column).
+
+    A NaN ARPU renders as "n/a" rather than the blank format_currency()
+    would give, since a blank cell in a currency column reads as zero at
+    a glance - and "this group has no cohort old enough to measure" is a
+    different statement from "this group earned nothing".
     """
     display = result.astype(object)
     for col in display.columns:
         if col == "FTD Count":
             display[col] = result[col].apply(lambda v: f"{v:,.0f}")
+        elif col == arpu_label:
+            display[col] = result[col].apply(
+                lambda v: "n/a" if pd.isna(v) else format_currency(v)
+            )
         else:
             display[col] = result[col].apply(format_currency)
     return display
@@ -1791,14 +1872,25 @@ with tab_cohort:
 
 def render_ranking_tab(tab, group_col, label):
     with tab:
-        st.subheader(f"Ranked by Player LTV - {label}")
-        st.caption(
-            "Lifetime totals across every FTD cohort, ranked highest Player LTV first. "
-            "Affiliate Costs includes Fixed Monthly Charge, split equally across each "
-            "FTD Month's new signups and attributed to their own acquisition month."
+        st.subheader(f"Ranked by ARPU after {ARPU_MATURITY_MONTHS} months - {label}")
+        excluded_ftd_months = immature_ftd_months(df)
+        excluded_display = ", ".join(
+            sorted(excluded_ftd_months, key=month_sort_key, reverse=True)
         )
-        result, profit_label, ltv_label = build_ranking_table(filtered, group_col, include_affiliate_costs)
-        display = format_ranking_table(result, profit_label, ltv_label)
+        st.caption(
+            f"ARPU after {ARPU_MATURITY_MONTHS} months is Profit divided by FTD Count with the "
+            f"{ARPU_MATURITY_MONTHS} most recent FTD-month cohorts removed from BOTH "
+            f"({excluded_display}), so groups aren't penalised for cohorts too "
+            "young to have earned out yet. Every other column is a lifetime total "
+            "across ALL cohorts, so ARPU won't equal this table's own Profit ÷ FTD "
+            "Count. Affiliate Costs includes Fixed Monthly Charge, split equally "
+            "across each FTD Month's new signups and attributed to their own "
+            "acquisition month."
+        )
+        result, profit_label, arpu_label = build_ranking_table(
+            filtered, group_col, include_affiliate_costs, excluded_ftd_months
+        )
+        display = format_ranking_table(result, profit_label, arpu_label)
         st.dataframe(display, use_container_width=True, height=min(35 * len(display) + 80, 700))
 
 
