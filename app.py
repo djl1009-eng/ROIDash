@@ -486,16 +486,13 @@ ACCOUNT_STATUS_ROW_ORDER = list(ACCOUNT_STATUS_BUCKETS.values()) + [
     OTHER_STATUS_LABEL,
 ]
 
-# Which buckets the "exclude inactive accounts" sidebar toggle removes.
-# Derived from ACCOUNT_STATUS_BUCKETS rather than written out again, so
-# renaming a display label can't silently stop the filter matching.
-# Deliberately does NOT include NO_STATUS_LABEL - see the toggle's help
-# text for why an unknown status is not treated as an inactive one.
-EXCLUDABLE_STATUS_LABELS = {
-    ACCOUNT_STATUS_BUCKETS["suspended"],
-    ACCOUNT_STATUS_BUCKETS["closed"],
-    ACCOUNT_STATUS_BUCKETS["blocked"],
-}
+# The buckets that get their own sidebar checkbox, in display order.
+# OTHER_STATUS_LABEL is deliberately absent: it's a residual bucket for
+# statuses nobody anticipated, so it has no checkbox and is ALWAYS
+# included. Giving an unknown value its own toggle would invite dropping
+# data without knowing what was dropped, and defaulting it to off would
+# hide rows silently.
+SELECTABLE_STATUS_LABELS = list(ACCOUNT_STATUS_BUCKETS.values()) + [NO_STATUS_LABEL]
 
 
 def bucket_account_status(series):
@@ -1548,24 +1545,36 @@ selected_campaigns = st.sidebar.multiselect("Campaign ID", campaign_ids)
 selected_commissions = st.sidebar.multiselect("Commission ID", commission_ids)
 
 st.sidebar.divider()
-exclude_inactive_accounts = st.sidebar.checkbox(
-    "Exclude suspended, closed and blocked accounts",
-    value=False,
-    disabled="Account Status" not in df.columns,
-    help=(
-        "Removes every row belonging to an account whose current "
-        "account_status is suspended, closed or blocked - affecting the "
-        "cohort table, every chart and all three ranking tabs.\n\n"
-        "Accounts under 'No status recorded' are KEPT. That bucket holds "
-        "both genuinely blank statuses and any account with no "
-        "customer_data row at all, so treating it as inactive would "
-        "quietly drop accounts on the strength of a missing join rather "
-        "than a known status.\n\n"
-        "account_status is a live snapshot, so this removes accounts by "
-        "how they stand today, including ones that were perfectly active "
-        "throughout the cohort period being measured."
-    ),
-)
+st.sidebar.caption("Include accounts with status")
+
+# One checkbox per status bucket, all ticked by default, so the default
+# view is the whole book and unticking is an explicit narrowing rather
+# than something the app does on your behalf.
+#
+# There is no checkbox for "Other status" - see
+# SELECTABLE_STATUS_LABELS. Those rows are always included.
+_status_column_present = "Account Status" in df.columns
+if not _status_column_present:
+    st.sidebar.caption("Unavailable - account statuses didn't load.")
+
+included_status_labels = {
+    label
+    for label in SELECTABLE_STATUS_LABELS
+    if st.sidebar.checkbox(
+        label.strip(),
+        value=True,
+        key=f"status_{label.strip()}",
+        disabled=not _status_column_present,
+        help=(
+            "Accounts with no account_status in customer_data, a blank one, "
+            "or no customer_data row at all. Untick with care: a broken join "
+            "would land accounts here rather than erroring, so this bucket "
+            "can contain accounts that are perfectly active."
+            if label == NO_STATUS_LABEL
+            else None
+        ),
+    )
+}
 
 st.sidebar.divider()
 include_affiliate_costs = st.sidebar.checkbox(
@@ -1622,14 +1631,23 @@ if selected_commissions:
 #
 # Status is an account-level fact repeated on every row of that account,
 # so filtering rows by it is equivalent to filtering accounts.
-if exclude_inactive_accounts and "Account Status" in filtered.columns and not filtered.empty:
+#
+# OTHER_STATUS_LABEL has no checkbox and is always kept - an
+# unanticipated status value shouldn't vanish from the totals just
+# because there's no control for it.
+if _status_column_present and not filtered.empty and set(included_status_labels) != set(SELECTABLE_STATUS_LABELS):
     status_buckets = bucket_account_status(filtered["Account Status"])
+    keep = status_buckets.isin(included_status_labels | {OTHER_STATUS_LABEL})
     before_count = filtered["Original player ID"].nunique()
-    filtered = filtered[~status_buckets.isin(EXCLUDABLE_STATUS_LABELS)]
+    filtered = filtered[keep]
     removed_count = before_count - filtered["Original player ID"].nunique()
+    excluded_labels = [
+        label.strip() for label in SELECTABLE_STATUS_LABELS
+        if label not in included_status_labels
+    ]
     st.sidebar.caption(
         f"Excluded {removed_count:,} of {before_count:,} accounts "
-        "(suspended, closed or blocked)."
+        f"({', '.join(excluded_labels).lower()})."
     )
 
 if exclude_outlier_accounts and not filtered.empty:
