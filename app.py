@@ -61,6 +61,8 @@ for the exact keys/format):
     who has the link.
 """
 
+import hashlib
+
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -1285,6 +1287,165 @@ def build_relative_day_retention(
     return wide.reindex(range(1, window + 1)).sort_index()
 
 
+# Columns summed as-is when flattening the view to one row per
+# (account, relative month) for the LTV model export. Everything else in
+# the export is derived from these.
+MODEL_EXPORT_SUM_COLUMNS = [
+    "Deposits sum", "Deposits count",
+    "Casino GGR", "SB GGR", "SB Correction",
+    "Free Spins Payout", "Free Bet Payout", "BOG Bonus", "Lucky Bonus",
+    "RGD Duty", "GBD Duty", "HBLB Levy", "Statutory Levy",
+    "Data Provider Fees",
+    "Casino Provider Fee", "Live Casino Provider Fee", "Virtuals Provider Fee",
+    "Trading Adjustments", "Estimated Processing Fees", "Admin/Platform Fees",
+    "Actual_Fixed_Fee", "Actual_RS", "Allocated Fixed Monthly Charge",
+]
+
+
+def hash_account_id(account_id):
+    """
+    A stable pseudonym for an account ID.
+
+    PSEUDONYMISATION, NOT ANONYMISATION - be clear-eyed about this. The
+    hash is deterministic and account IDs come from a small enumerable
+    space, so anyone holding the ID list can rebuild the mapping by
+    hashing every candidate. It stops a raw customer identifier being
+    copied into a file that leaves the building; it does not make the
+    file safe to publish. Treat an export as confidential either way.
+    """
+    return hashlib.sha256(str(account_id).encode("utf-8")).hexdigest()[:16]
+
+
+def cohort_months_elapsed(ftd_month, as_of):
+    """Whole calendar months from an MM/YY cohort label to as_of."""
+    year, month = month_sort_key(ftd_month)
+    if (year, month) == (0, 0):
+        return -1
+    return (as_of.year * 12 + as_of.month) - (year * 12 + month)
+
+
+def build_ltv_model_export(base_df, lifecycle_df, min_months_observed, max_accounts=0, as_of=None):
+    """
+    Flattens the ROI dash to ONE ROW PER (account, relative month) for
+    survival-weighted LTV modelling, and returns (dataframe, note).
+
+    Per-relative-month grain is the entire point. Lifetime totals can
+    only support a model of average player value, which forces the
+    assumption that a marginal retained player earns what an average one
+    does - the assumption most likely to be wrong and most likely to
+    flatter the answer. Month-by-month rows let that be derived instead.
+
+    Only cohorts with at least min_months_observed whole months since
+    their FTD month are included, so every account has had a comparable
+    chance to earn out. Mixing a 1-month-old cohort into a survival
+    model biases every curve downward at exactly the tail the model
+    depends on.
+
+    Both profit definitions are emitted (incl. and excl. affiliate
+    costs) rather than whichever the sidebar toggle currently says, so
+    the export doesn't silently inherit a UI setting - a model built on
+    the wrong one would be wrong in a way that's invisible in the file.
+
+    FTD Count is NOT summed: it is 1 on every one of an account's
+    commission rows (see allocate_fixed_monthly_charge()), so summing it
+    counts multi-commission accounts several times. An is_ftd_month flag
+    derived from Relative Month == 1 carries the same information
+    without that trap.
+
+    max_accounts > 0 takes a reproducible random sample of ACCOUNTS
+    (never of rows - sampling rows would tear an account's history apart
+    and make survival meaningless). Seeded, so the same request gives
+    the same file.
+    """
+    as_of = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.today()
+
+    d = base_df[base_df["Relative Month"] >= 1].copy()
+    if d.empty:
+        return pd.DataFrame(), "No rows with a Relative Month of 1 or more."
+
+    elapsed = d["FTD Month"].map(lambda m: cohort_months_elapsed(m, as_of))
+    d = d[elapsed >= min_months_observed]
+    if d.empty:
+        return pd.DataFrame(), (
+            f"No cohort has {min_months_observed}+ whole months of history yet."
+        )
+
+    if max_accounts and d["Original player ID"].nunique() > max_accounts:
+        sampled = (
+            pd.Series(d["Original player ID"].unique())
+            .sample(n=max_accounts, random_state=42)
+        )
+        d = d[d["Original player ID"].isin(set(sampled))]
+
+    present = [c for c in MODEL_EXPORT_SUM_COLUMNS if c in d.columns]
+    grouped = (
+        d.groupby(["Original player ID", "FTD Month", "Relative Month", "Activity Month"], dropna=False)[present]
+        .sum()
+        .reset_index()
+    )
+
+    # Partner is taken per ACCOUNT, not per row - an account can sit
+    # under several commissions, and a row-level partner would let one
+    # account appear under two partners in the same month.
+    partner_by_account = (
+        d.sort_values("Partner ID").groupby("Original player ID")["Partner ID"].first()
+    )
+    grouped["partner_id"] = grouped["Original player ID"].map(partner_by_account)
+
+    out = pd.DataFrame({
+        "account_hash": grouped["Original player ID"].map(hash_account_id),
+        "partner_id": grouped["partner_id"],
+        "ftd_month": grouped["FTD Month"],
+        "activity_month": grouped["Activity Month"],
+        "relative_month": grouped["Relative Month"],
+        "is_ftd_month": (grouped["Relative Month"] == 1).astype(int),
+    })
+
+    def g(col):
+        return grouped[col] if col in grouped.columns else 0.0
+
+    out["deposits_sum"] = g("Deposits sum")
+    out["deposits_count"] = g("Deposits count")
+    out["casino_ggr"] = g("Casino GGR")
+    out["sports_ggr"] = g("SB GGR") + g("SB Correction")
+    out["total_ggr"] = out["casino_ggr"] + out["sports_ggr"]
+    out["total_bonus"] = g("Free Spins Payout") + g("Free Bet Payout") + g("BOG Bonus") + g("Lucky Bonus")
+    out["total_taxes_duties"] = g("RGD Duty") + g("GBD Duty") + g("HBLB Levy") + g("Statutory Levy")
+    out["total_other_fees"] = (
+        g("Data Provider Fees") + g("Casino Provider Fee") + g("Live Casino Provider Fee")
+        + g("Virtuals Provider Fee") + g("Trading Adjustments")
+        + g("Estimated Processing Fees") + g("Admin/Platform Fees")
+    )
+    fixed_fee, rev_share, fmc = g("Actual_Fixed_Fee"), g("Actual_RS"), g("Allocated Fixed Monthly Charge")
+    out["affiliate_costs"] = fixed_fee + rev_share + fmc + (fixed_fee + rev_share + fmc) * 0.2
+    out["profit_excl_affiliate"] = out["total_ggr"] - out["total_bonus"] - out["total_taxes_duties"] - out["total_other_fees"]
+    out["profit_incl_affiliate"] = out["profit_excl_affiliate"] - out["affiliate_costs"]
+
+    # Account-level survival facts, repeated on every row of that
+    # account so the file is usable without a second join.
+    if lifecycle_df is not None and not lifecycle_df.empty:
+        life = lifecycle_df.dropna(subset=["ftd_at"]).copy()
+        life["ftd_date"] = to_local_naive_date(life["ftd_at"])
+        life["last_date"] = to_local_naive_date(life["last_deposit_at"])
+        life = life.dropna(subset=["ftd_date"])
+        life["player_key"] = life["player_id"].astype(str)
+        life = life.drop_duplicates(subset=["player_key"], keep="first").set_index("player_key")
+
+        keys = grouped["Original player ID"].astype(str)
+        ftd_dates = keys.map(life["ftd_date"])
+        last_dates = keys.map(life["last_date"])
+        out["ftd_date"] = ftd_dates.dt.strftime("%Y-%m-%d")
+        out["last_deposit_date"] = last_dates.dt.strftime("%Y-%m-%d")
+        out["days_ftd_to_last_deposit"] = (last_dates - ftd_dates).dt.days
+
+    out = out.sort_values(["account_hash", "relative_month"]).reset_index(drop=True)
+    note = (
+        f"{len(out):,} rows, {out['account_hash'].nunique():,} accounts, "
+        f"cohorts {min_months_observed}+ months old."
+    )
+    return out, note
+
+
 def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv):
     """
     Per-group sums of every component the ranking tables need, plus the
@@ -1968,8 +2129,8 @@ if filtered.empty:
 
 # ── TABS ─────────────────────────────────────────────────────────────
 
-tab_cohort, tab_partner, tab_campaign, tab_commission = st.tabs([
-    "FTD Cohort View", "By Partner", "By Campaign ID", "By Commission ID",
+tab_cohort, tab_partner, tab_campaign, tab_commission, tab_export = st.tabs([
+    "FTD Cohort View", "By Partner", "By Campaign ID", "By Commission ID", "Model Export",
 ])
 
 with tab_cohort:
@@ -2121,6 +2282,73 @@ def render_ranking_tab(tab, group_col, label):
             result.index.name = "Partner"
         display = format_ranking_table(result, profit_label, arpu_label)
         st.dataframe(display, use_container_width=True, height=min(35 * len(display) + 80, 700))
+
+
+with tab_export:
+    st.subheader("LTV model export")
+    st.caption(
+        "One row per account per relative month, for survival-weighted LTV "
+        "modelling. Account IDs are replaced with a stable hash - which is "
+        "pseudonymisation, not anonymisation: the mapping is rebuildable by "
+        "anyone holding the ID list, so treat the file as confidential."
+    )
+
+    export_min_months = st.number_input(
+        "Minimum whole months since FTD",
+        min_value=0, max_value=36, value=6, step=1,
+        help=(
+            "Only cohorts at least this old are included, so every account has "
+            "had a comparable chance to earn out. Mixing very young cohorts in "
+            "biases a survival model downward at exactly the tail it depends on."
+        ),
+    )
+    export_max_accounts = st.number_input(
+        "Cap on number of accounts (0 = no cap)",
+        min_value=0, value=0, step=1000,
+        help=(
+            "Takes a reproducible random sample of ACCOUNTS, never of rows - "
+            "sampling rows would tear an account's history apart and make "
+            "survival meaningless. Useful for a quick look before exporting "
+            "everything."
+        ),
+    )
+    export_apply_filters = st.checkbox(
+        "Apply the current sidebar filters",
+        value=False,
+        help=(
+            "Off by default, deliberately. The outlier and account-status "
+            "toggles remove accounts in ways that would bias a retention model "
+            "without being visible in the exported file - the survivorship "
+            "problem in miniature. Leave off unless you specifically want a "
+            "filtered slice."
+        ),
+    )
+
+    if st.button("Build export"):
+        source = filtered if export_apply_filters else df
+        with st.spinner("Building export..."):
+            # Called again rather than reusing the cohort tab's variable:
+            # it's cached, so this is free, and it removes a dependency on
+            # which tab body happened to run first.
+            export_df, export_note = build_ltv_model_export(
+                source,
+                load_deposit_lifecycle_data(),
+                int(export_min_months),
+                int(export_max_accounts),
+            )
+        if export_df.empty:
+            st.warning(export_note)
+        else:
+            st.success(export_note)
+            st.dataframe(export_df.head(20), use_container_width=True)
+            st.download_button(
+                "Download CSV",
+                data=export_df.to_csv(index=False).encode("utf-8"),
+                file_name=(
+                    f"ltv_model_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+                ),
+                mime="text/csv",
+            )
 
 
 render_ranking_tab(tab_partner, "Partner ID", "Partner")
