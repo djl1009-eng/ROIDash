@@ -44,6 +44,14 @@ in a few places - see commit history / conversation for why):
     ID). Since it's genuinely row-level once allocated, it's correctly
     included in the Partner/Campaign/Commission ranking tables too.
 
+The "30 Days % of Players Still Depositing" chart at the bottom of the
+FTD Cohort View is fed by a SEPARATE query (see
+load_deposit_lifecycle_data()) joining each account's FTD timestamp to
+its most recent deposit, and is a SURVIVAL curve rather than a
+per-period snapshot like the monthly charts - see
+build_relative_day_retention()'s docstring, which is worth reading
+before drawing conclusions from its shape.
+
 Deployment: Streamlit Community Cloud. Requires two secrets to be set
 in the app's Settings -> Secrets (see .streamlit/secrets.toml.example
 for the exact keys/format):
@@ -79,6 +87,32 @@ SOURCE_VIEW = "Affilka ROI Dash"
 FIXED_MONTHLY_CHARGE_AMOUNT = 3500.0
 
 _MONTH_ABBR_ORDER = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+
+# ── 30-DAY RETENTION CHART CONFIG ─────────────────────────────────────
+
+RELATIVE_DAY_WINDOW = 30
+
+# Minimum number of still-observable accounts a (cohort, day) point
+# needs before it's plotted at all. Below this, one account flipping
+# from active to lapsed moves the line by 20+ percentage points, which
+# reads as a retention cliff rather than as a sample-size artefact.
+# Same intent as the sidebar's min_ftd_count, applied per-point.
+MIN_OBSERVED_ACCOUNTS_PER_POINT = 5
+
+# CONFIRM THIS BEFORE DEPLOYING. customer_data is merged on wallet_code
+# (see merge_reports.py / UploadCustomerData.py), while the ROI dash
+# keys on "Original player ID". If those aren't the same identifier in
+# your warehouse, this join silently returns all-NULL last-deposit dates
+# and every account gets excluded - which looks like a data problem
+# upstream rather than a config error here. Sanity check: the exclusion
+# caption rendered under the chart.
+CUSTOMER_DATA_JOIN_KEY = "wallet_code"
+
+# Likewise confirm the FTD source table name and column. This assumes
+# "Affilka Data" holds first_deposit_processed_at, at commission-row
+# granularity (hence the MIN + GROUP BY to collapse to one row per
+# account, taking the EARLIEST across an account's commissions).
+AFFILKA_SOURCE_TABLE = "Affilka Data"
 
 
 # ── PASSWORD GATE ────────────────────────────────────────────────────
@@ -227,6 +261,76 @@ def load_roi_dash_data():
             "resolved."
         )
         st.stop()
+
+
+@st.cache_data(ttl=600)
+def load_deposit_lifecycle_data():
+    """
+    One row per account: when they made their first deposit, and when
+    they last made one. Feeds the 30-day retention chart only.
+
+    Deliberately a separate query from load_roi_dash_data() rather than
+    extra columns on it - the ROI dash view is at (account, activity
+    month, commission) granularity, and both of these timestamps are
+    account-level facts that would repeat across every one of an
+    account's rows.
+
+    Cached for 10 minutes to match load_roi_dash_data(), and uses the
+    same extended statement timeout and get_healthy_connection() for the
+    same reasons documented there. Unlike that query, a failure here
+    degrades gracefully to an empty frame rather than st.stop() - this
+    chart is one panel, not the whole dashboard, so it shouldn't be able
+    to take the page down with it.
+    """
+    conn = get_healthy_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            WITH ftd AS (
+                -- MIN() is the point of this CTE, not incidental: an
+                -- account with several Commission IDs has a
+                -- first_deposit_processed_at on each of its rows, and
+                -- the EARLIEST of those is the account's real FTD.
+                -- Collapsing to one row per account here also stops the
+                -- join below fanning out and counting the account once
+                -- per commission in every denominator - the same
+                -- multi-commission double-counting already found and
+                -- fixed for Spiros_Fixed_Fee and Fixed Monthly Charge.
+                SELECT
+                    "Original player ID" AS player_id,
+                    MIN("first_deposit_processed_at") AS ftd_at
+                FROM "{AFFILKA_SOURCE_TABLE}"
+                WHERE "first_deposit_processed_at" IS NOT NULL
+                GROUP BY 1
+            ),
+            last_dep AS (
+                -- Aggregated for the same reason: if customer_data ever
+                -- holds more than one row per key, an un-aggregated join
+                -- would silently double-weight those accounts in every
+                -- percentage rather than erroring.
+                SELECT
+                    "{CUSTOMER_DATA_JOIN_KEY}" AS player_id,
+                    MAX("last_successful_deposit") AS last_deposit_at
+                FROM "customer_data"
+                GROUP BY 1
+            )
+            SELECT
+                f.player_id,
+                f.ftd_at,
+                l.last_deposit_at
+            FROM ftd f
+            LEFT JOIN last_dep l
+                   ON l.player_id = f.player_id
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.warning(
+            f"Couldn't load deposit lifecycle data ({e}) - the 30-day "
+            "retention chart is unavailable. The rest of the dashboard is "
+            "unaffected."
+        )
+        return pd.DataFrame(columns=["player_id", "ftd_at", "last_deposit_at"])
 
 
 def allocate_fixed_monthly_charge(full_df, fixed_charge_amount):
@@ -614,6 +718,139 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     }
 
 
+def build_relative_day_retention(
+    lifecycle_df,
+    cohort_months=None,
+    window=RELATIVE_DAY_WINDOW,
+    min_observed=MIN_OBSERVED_ACCOUNTS_PER_POINT,
+    as_of=None,
+):
+    """
+    Builds "% of Players Still Depositing" by RELATIVE DAY (1-window),
+    one line per FTD Month cohort - the same cohort grouping and the
+    same MM/YY labels as every other chart in this app, so colours and
+    legend order stay consistent.
+
+    Day 1 is the account's OWN FTD day. An account counts as "still
+    depositing" at day N if its last successful deposit falls on or
+    after its own day N.
+
+    THIS IS A SURVIVAL CURVE, NOT A PER-DAY SNAPSHOT. customer_data's
+    last_successful_deposit is ONE timestamp per account, not a deposit
+    event log, so "did this account deposit ON day N" is not answerable
+    from it. What IS answerable is "was this account's deposit lifetime
+    still running at day N". Concretely, versus the monthly
+    "% of Players Still Depositing" chart above:
+
+      - Monthly chart: an account with no deposit in relative month 3
+        but one in month 4 is absent from month 3 and present in month
+        4. That line can go back up.
+      - This chart: an account whose last deposit is day 25 counts as
+        "still depositing" on every day 1-25, including days it made no
+        deposit at all. This line can only go down.
+
+    For a 30-day window that's the more readable chart regardless - a
+    literal "% depositing ON day N" would fall to near-zero by day 3,
+    since very few accounts deposit daily.
+
+    THE DENOMINATOR IS PER-DAY, NOT PER-COHORT. At day N, only accounts
+    that have actually had N days elapsed since their own FTD are
+    counted. This matters more than it sounds: a monthly cohort spans up
+    to 31 FTD dates, so mid-month a single cohort contains accounts with
+    wildly different observation windows. Using the whole cohort as a
+    fixed denominator would make every young cohort's curve slope
+    downward purely because its late-in-the-month signups haven't had
+    time to deposit again yet - a censoring artefact that looks
+    identical to real churn. This is the day-level equivalent of the
+    NaN-not-zero handling in build_relative_month_series().
+
+    A consequence worth knowing: the denominator shrinks as N grows for
+    any cohort still inside its own 30-day window, so those tails are
+    built on fewer accounts. min_observed suppresses the points where
+    that gets too thin.
+
+    Accounts with no recorded last_successful_deposit are DROPPED, not
+    counted. Two consequences to keep in mind: every cohort's
+    denominator here is "accounts with a recorded last deposit" rather
+    than its FTD Count, so cohort sizes won't tie back to the table
+    above; and if those NULLs represent a customer_data coverage gap
+    rather than genuinely inactive accounts, retention is overstated by
+    exactly the accounts most likely to have lapsed. The call site
+    reports how many were dropped so that's visible rather than assumed.
+
+    An account whose last deposit is dated BEFORE its own FTD is a data
+    inconsistency rather than a missing value, so it's clamped to the
+    FTD date (i.e. counted as day-1-only) rather than dropped.
+
+    as_of defaults to today, and is a parameter mainly so this is
+    testable against a fixed date.
+
+    Returns a wide DataFrame - index "Relative Day", one column per FTD
+    Month, values 0-100. NaN is left in deliberately (no .fillna(0)) for
+    (cohort, day) combinations that either haven't happened yet or fall
+    below min_observed, so Altair breaks the line rather than drawing a
+    0% point that reads as total churn.
+    """
+    empty = pd.DataFrame(index=pd.RangeIndex(1, window + 1, name="Relative Day"))
+    if lifecycle_df.empty:
+        return empty
+
+    d = lifecycle_df.dropna(subset=["ftd_at"]).copy()
+    if d.empty:
+        return empty
+
+    d["ftd_date"] = pd.to_datetime(d["ftd_at"], errors="coerce").dt.normalize()
+    d["last_date"] = pd.to_datetime(d["last_deposit_at"], errors="coerce").dt.normalize()
+    d = d.dropna(subset=["ftd_date"])
+
+    # No recorded last deposit -> removed entirely, so these accounts
+    # appear in no denominator at all. See docstring for what that does
+    # to the interpretation of the curve.
+    d = d.dropna(subset=["last_date"])
+    if d.empty:
+        return empty
+
+    # Last deposit predating the account's own FTD is an inconsistency,
+    # not a missing value - clamped rather than dropped.
+    d.loc[d["last_date"] < d["ftd_date"], "last_date"] = d["ftd_date"]
+
+    # Same MM/YY cohort label the rest of the app uses, derived here from
+    # the FTD timestamp. If the ROI dash view derives its own "FTD Month"
+    # any other way (e.g. from an Affilka-supplied month field with a
+    # different timezone or cutoff), a handful of accounts near a month
+    # boundary could land in a different cohort here than they do in the
+    # table above.
+    d["FTD Month"] = d["ftd_date"].dt.strftime("%m/%y")
+
+    if cohort_months is not None:
+        d = d[d["FTD Month"].isin(cohort_months)]
+    if d.empty:
+        return empty
+
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+
+    d["last_relative_day"] = (d["last_date"] - d["ftd_date"]).dt.days + 1
+    d["days_observed"] = (as_of_ts - d["ftd_date"]).dt.days + 1
+
+    records = []
+    for month, cohort in d.groupby("FTD Month"):
+        observed = cohort["days_observed"].to_numpy()
+        last_day = cohort["last_relative_day"].to_numpy()
+        for day in range(1, window + 1):
+            eligible = observed >= day
+            n_eligible = int(eligible.sum())
+            if n_eligible < min_observed:
+                pct = float("nan")
+            else:
+                still = int((last_day[eligible] >= day).sum())
+                pct = 100.0 * still / n_eligible
+            records.append({"FTD Month": month, "Relative Day": day, "pct": pct})
+
+    long = pd.DataFrame(records)
+    wide = long.pivot(index="Relative Day", columns="FTD Month", values="pct").astype(float)
+    return wide.reindex(range(1, window + 1)).sort_index()
+
+
 def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
     """
     Groups the (already-filtered) dataframe by group_col (Partner ID,
@@ -714,10 +951,10 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
-def render_cumulative_chart(df_wide, is_percent=False):
+def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month", y_title=None):
     """
-    Renders a wide-format DataFrame (index = Relative Month, one column
-    per FTD Month cohort) as a line chart with an auto-scaling Y-axis -
+    Renders a wide-format DataFrame (index = x_field, one column per FTD
+    Month cohort) as a line chart with an auto-scaling Y-axis -
     st.line_chart() always forces the Y-axis to start at 0 with no way
     to override that, which compresses later, higher-value data toward
     the top of the chart and hides smaller month-to-month movement.
@@ -729,9 +966,12 @@ def render_cumulative_chart(df_wide, is_percent=False):
     axis anchored at zero - unlike the currency charts, 0-100% is a
     natural, meaningful bound worth keeping visible rather than
     auto-scaling away.
+
+    x_field names the index column, so the same renderer handles both
+    the "Relative Month" series and the "Relative Day" retention chart.
     """
     df_long = df_wide.reset_index().melt(
-        id_vars="Relative Month", var_name="FTD Month", value_name="value"
+        id_vars=x_field, var_name="FTD Month", value_name="value"
     )
     # Altair sorts a nominal color field alphabetically as strings by
     # default (e.g. "01/26" before "11/25", since "0" < "1"
@@ -740,9 +980,11 @@ def render_cumulative_chart(df_wide, is_percent=False):
     # legend (and matching line/point colors) true chronological order
     # instead.
     cohort_order = sorted(df_long["FTD Month"].dropna().unique(), key=month_sort_key)
+    if y_title is None:
+        y_title = "% still depositing" if is_percent else ""
     y_axis = alt.Y(
         "value:Q",
-        title="% still depositing" if is_percent else "",
+        title=y_title,
         scale=alt.Scale(zero=True) if is_percent else alt.Scale(zero=False),
         axis=alt.Axis(format=".0f") if is_percent else alt.Axis(),
     )
@@ -751,13 +993,13 @@ def render_cumulative_chart(df_wide, is_percent=False):
         .mark_line(point=True)
         .encode(
             x=alt.X(
-                "Relative Month:Q",
-                title="Relative Month",
+                f"{x_field}:Q",
+                title=x_field,
                 axis=alt.Axis(tickMinStep=1, format="d"),
             ),
             y=y_axis,
             color=alt.Color("FTD Month:N", title="FTD Month", sort=cohort_order),
-            tooltip=["FTD Month", "Relative Month", "value"],
+            tooltip=["FTD Month", x_field, "value"],
         )
         .properties(height=350)
     )
@@ -1125,6 +1367,67 @@ with tab_cohort:
             with col:
                 st.caption(chart_title)
                 render_cumulative_chart(chart_df, is_percent=(chart_title == "% of Players Still Depositing"))
+
+    # ── 30 DAYS % OF PLAYERS STILL DEPOSITING ──
+    # Fed by its own query (account-level FTD + last deposit
+    # timestamps), not by the ROI dash view - see
+    # load_deposit_lifecycle_data() and build_relative_day_retention().
+    st.divider()
+    st.subheader(f"{RELATIVE_DAY_WINDOW} Days % of Players Still Depositing")
+    st.caption(
+        "Share of each FTD cohort whose LAST successful deposit falls on or after "
+        "that relative day (day 1 = the account's own FTD day). This is a survival "
+        "curve, not a per-day activity snapshot: an account whose last deposit is "
+        "day 25 counts on every day up to 25, including days it didn't deposit. "
+        "Each day only counts accounts that have actually had that many days since "
+        "their own FTD, so young cohorts stop rather than falling away. Accounts "
+        "with no recorded last successful deposit are excluded."
+    )
+
+    lifecycle = load_deposit_lifecycle_data()
+
+    if lifecycle.empty:
+        st.info("No deposit lifecycle data available.")
+    else:
+        # Restricting by player_id against `filtered` makes this chart
+        # respect every sidebar control - Partner/Campaign/Commission and
+        # the outlier exclusion - without reimplementing any of that
+        # filtering logic here.
+        #
+        # Both sides are cast to str first: "Original player ID" and
+        # customer_data's key can differ in dtype (int64 vs object)
+        # between the two queries, and .isin() across mismatched dtypes
+        # matches NOTHING silently rather than erroring - which would
+        # render an empty chart that looks like a data problem upstream.
+        filtered_ids = set(filtered["Original player ID"].dropna().astype(str))
+        lifecycle_scoped = lifecycle[lifecycle["player_id"].astype(str).isin(filtered_ids)]
+
+        if lifecycle_scoped.empty:
+            st.info(
+                "No accounts matched between the ROI dash and the deposit "
+                f"lifecycle query - check that customer_data.{CUSTOMER_DATA_JOIN_KEY} "
+                "is the same identifier as \"Original player ID\"."
+            )
+        else:
+            # Reported rather than silent: these accounts are excluded
+            # from every denominator, so if the number is large the
+            # curves are describing a self-selected subset. A high figure
+            # is also the first symptom of a wrong join key, since a bad
+            # key produces NULLs rather than an error.
+            n_matched = len(lifecycle_scoped)
+            n_no_last_deposit = int(lifecycle_scoped["last_deposit_at"].isna().sum())
+            if n_no_last_deposit:
+                st.caption(
+                    f"Excluded {n_no_last_deposit:,} of {n_matched:,} accounts with no "
+                    "recorded last successful deposit."
+                )
+
+            day_retention = build_relative_day_retention(
+                lifecycle_scoped, cohort_months=months
+            )
+            render_cumulative_chart(
+                day_retention, is_percent=True, x_field="Relative Day"
+            )
 
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
