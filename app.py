@@ -2295,13 +2295,32 @@ with tab_export:
 
     export_min_months = st.number_input(
         "Minimum whole months since FTD",
-        min_value=0, max_value=36, value=6, step=1,
+        min_value=0, max_value=36, value=3, step=1,
         help=(
-            "Only cohorts at least this old are included, so every account has "
-            "had a comparable chance to earn out. Mixing very young cohorts in "
-            "biases a survival model downward at exactly the tail it depends on."
+            "This is really a choice of LTV HORIZON: at 3, every included cohort "
+            "has at least 3 months of history, so LTV can be modelled out to "
+            "relative month 3. Set it no higher than the longest horizon you "
+            "actually need - a lower value is strictly more data, and a model "
+            "can always filter upward, whereas an export can't recover cohorts "
+            "it left out.\n\n"
+            "Note this excludes cohorts ACQUIRED in the last N months, not the "
+            "last N months of activity - an included cohort keeps its spend "
+            "right up to today."
         ),
     )
+
+    # Live feedback on the trade-off, so the threshold is chosen against
+    # the real cohort count rather than guessed at.
+    _as_of = pd.Timestamp.today()
+    _all_cohorts = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key)
+    _kept = [m for m in _all_cohorts if cohort_months_elapsed(m, _as_of) >= int(export_min_months)]
+    if _kept:
+        st.caption(
+            f"{len(_kept)} of {len(_all_cohorts)} cohorts qualify "
+            f"({_kept[0]}-{_kept[-1]}); {len(_all_cohorts) - len(_kept)} excluded as too recent."
+        )
+    else:
+        st.caption(f"No cohort is {int(export_min_months)}+ months old - nothing would be exported.")
     export_max_accounts = st.number_input(
         "Cap on number of accounts (0 = no cap)",
         min_value=0, value=0, step=1000,
