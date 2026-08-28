@@ -44,6 +44,14 @@ in a few places - see commit history / conversation for why):
     ID). Since it's genuinely row-level once allocated, it's correctly
     included in the Partner/Campaign/Commission ranking tables too.
 
+The "30 Days % of Players Still Depositing" chart at the bottom of the
+FTD Cohort View is fed by a SEPARATE query (see
+load_deposit_lifecycle_data()) joining each account's FTD timestamp to
+its most recent deposit, and is a SURVIVAL curve rather than a
+per-period snapshot like the monthly charts - see
+build_relative_day_retention()'s docstring, which is worth reading
+before drawing conclusions from its shape.
+
 Deployment: Streamlit Community Cloud. Requires two secrets to be set
 in the app's Settings -> Secrets (see .streamlit/secrets.toml.example
 for the exact keys/format):
@@ -52,6 +60,8 @@ for the exact keys/format):
     Community Cloud app's URL is otherwise publicly reachable by anyone
     who has the link.
 """
+
+import hashlib
 
 import streamlit as st
 import pandas as pd
@@ -72,6 +82,23 @@ DB_PORT = 5432
 
 SOURCE_VIEW = "Affilka ROI Dash"
 
+# ── PARTNER NAME LOOKUP ──────────────────────────────────────────────
+# Partner ID -> Partner Name, read from columns A and B of the named tab
+# of a Google Sheet.
+#
+# THE SHEET MUST BE LINK-SHARED for this to work from Streamlit
+# Community Cloud: File -> Share -> General access -> "Anyone with the
+# link" -> Viewer. The gviz endpoint below needs no API key, no service
+# account and no secrets, but it can only read a sheet that is readable
+# without signing in. A restricted sheet returns HTML sign-in page
+# rather than CSV, which is caught and reported.
+#
+# Addressed by TAB NAME rather than by gid, so it survives the tab being
+# moved and doesn't need a magic number looked up from the URL. The name
+# must match the tab exactly, including case.
+PARTNER_NAMES_SHEET_ID = "1pivdLPohl87NVCXcLLODrmZ6F8w4R4RXvYnKrDhIpOs"
+PARTNER_NAMES_SHEET_TAB = "Commissions"
+
 # A flat, genuinely fixed cost applied to every Activity Month - no UI
 # to edit this, since it doesn't vary. If this ever needs to change,
 # update the number here directly (and the app will pick it up on its
@@ -79,6 +106,66 @@ SOURCE_VIEW = "Affilka ROI Dash"
 FIXED_MONTHLY_CHARGE_AMOUNT = 3500.0
 
 _MONTH_ABBR_ORDER = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+
+# ── 30-DAY RETENTION CHART CONFIG ─────────────────────────────────────
+
+# How many of the most recent FTD-month cohorts "ARPU after N months"
+# excludes, so the metric only reflects cohorts that have had time to
+# earn out. Changing this renames the ranking-table column too.
+ARPU_MATURITY_MONTHS = 3
+
+RELATIVE_DAY_WINDOW = 30
+
+# The timezone every timestamp is reduced to before its calendar date is
+# taken. This is not cosmetic: "First deposit date" is timestamptz, so
+# an FTD at 00:30 BST is the PREVIOUS day in UTC, which would shift that
+# account a full day on every relative-day calculation and move accounts
+# between cohorts at month boundaries. UK book, so London is the
+# meaningful day boundary.
+LOCAL_TIMEZONE = "Europe/London"
+
+# Minimum number of still-observable accounts a (cohort, day) point
+# needs before it's plotted at all. Below this, one account flipping
+# from active to lapsed moves the line by 20+ percentage points, which
+# reads as a retention cliff rather than as a sample-size artefact.
+# Same intent as the sidebar's min_ftd_count, applied per-point.
+MIN_OBSERVED_ACCOUNTS_PER_POINT = 5
+
+# The fraction of a cohort that must still be observable at a given
+# relative day for that point to be plotted.
+#
+# Without this, a cohort's line keeps going long after the denominator
+# has stopped being the cohort and become a small, early-signing slice
+# of it: on 25 Aug, day 25 of the 08/26 cohort is answerable ONLY by
+# accounts that signed up on 1 Aug. Each step right then swaps in a
+# different population rather than following one forward, and the line
+# can RISE - which on a survival curve reads as accounts coming back
+# from the dead when nothing of the sort happened.
+#
+# At 0.9, a fully mature cohort (every account past 30 days) keeps all
+# thirty points, since its coverage is 100% throughout. A cohort still
+# inside its own window stops early - the current month typically after
+# a few days - which is the honest length for it.
+MIN_COHORT_COVERAGE_PER_POINT = 0.9
+
+# The 30-day chart sources its FTD timestamps from SOURCE_VIEW rather
+# than the underlying "Affilka Data" table, so "Original player ID" is
+# literally the same column here as in load_roi_dash_data() - the chart
+# can't drift out of alignment with the sidebar filters it's scoped by.
+# Per the view definition, that column is "Affilka Data"."Account ID"
+# surfaced under a different name.
+#
+# That leaves customer_data as the only join with any uncertainty in it,
+# and not much: the view itself already joins "Customer Trading Data
+# Monthly" on "Wallet Code" = "Account ID", so wallet_code and
+# "Original player ID" are the same identifier. Both sides are still
+# cast to text, since "Account ID" is bigint and wallet_code may be
+# text - Postgres would otherwise refuse the comparison outright.
+#
+# A wrong key here fails visibly rather than silently: every account
+# ends up with a NULL last deposit and gets excluded, which the caption
+# under the chart reports.
+CUSTOMER_DATA_JOIN_KEY = "wallet_code"
 
 
 # ── PASSWORD GATE ────────────────────────────────────────────────────
@@ -229,6 +316,280 @@ def load_roi_dash_data():
         st.stop()
 
 
+@st.cache_data(ttl=600)
+def load_deposit_lifecycle_data():
+    """
+    One row per account: when they made their first deposit, and when
+    they last made one. Feeds the 30-day retention chart only.
+
+    FTD timestamps come from SOURCE_VIEW rather than the underlying
+    "Affilka Data" table, so "Original player ID" is the identical
+    column to the one load_roi_dash_data() returns - the chart is scoped
+    by that ID against the sidebar-filtered frame, and sourcing both
+    from the same place removes any chance of the two drifting apart.
+
+    Deliberately a separate query from load_roi_dash_data() rather than
+    extra columns on it. Two reasons: the view is at (account, activity
+    month, commission) grain and both of these timestamps are
+    account-level facts that would repeat across every one of an
+    account's rows; and keeping it separate is what lets a failure here
+    degrade to a missing chart instead of taking the dashboard down.
+
+    Cached for 10 minutes to match load_roi_dash_data(), and uses the
+    same extended statement timeout and get_healthy_connection() for the
+    same reasons documented there. Unlike that query, a failure here
+    degrades gracefully to an empty frame rather than st.stop() - this
+    chart is one panel, not the whole dashboard, so it shouldn't be able
+    to take the page down with it.
+    """
+    conn = get_healthy_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            WITH ftd AS (
+                -- MIN() is the point of this CTE, not incidental: the
+                -- view is at (account, Activity Month, Commission ID)
+                -- grain, each row carrying "First deposit date", and the
+                -- EARLIEST of those is the account's real FTD.
+                -- Collapsing to one row per account here also stops the
+                -- join below fanning out and counting the account once
+                -- per commission-month in every denominator - the same
+                -- multi-commission double-counting already found and
+                -- fixed for Spiros_Fixed_Fee and Fixed Monthly Charge.
+                --
+                -- "Original player ID" is nullable upstream (it is
+                -- "Affilka Data"."Account ID" surfaced under another
+                -- name), and SQL would otherwise collapse every NULL
+                -- into a single phantom account, so those rows are
+                -- excluded outright.
+                SELECT
+                    "Original player ID" AS player_id,
+                    MIN("First deposit date") AS ftd_at
+                FROM "{SOURCE_VIEW}"
+                WHERE "First deposit date" IS NOT NULL
+                  AND "Original player ID" IS NOT NULL
+                GROUP BY 1
+            ),
+            last_dep AS (
+                -- Aggregated for the same reason: if customer_data ever
+                -- holds more than one row per key, an un-aggregated join
+                -- would silently double-weight those accounts in every
+                -- percentage rather than erroring.
+                SELECT
+                    "{CUSTOMER_DATA_JOIN_KEY}"::text AS customer_key,
+                    MAX("last_successful_deposit") AS last_deposit_at
+                FROM "customer_data"
+                GROUP BY 1
+            )
+            SELECT
+                f.player_id,
+                f.ftd_at,
+                l.last_deposit_at
+            FROM ftd f
+            LEFT JOIN last_dep l
+                   ON l.customer_key = f.player_id::text
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.warning(
+            f"Couldn't load deposit lifecycle data ({e}) - the 30-day "
+            "retention chart is unavailable. The rest of the dashboard is "
+            "unaffected."
+        )
+        return pd.DataFrame(columns=["player_id", "ftd_at", "last_deposit_at"])
+
+
+@st.cache_data(ttl=600)
+def load_account_status_data():
+    """
+    One row per account: its current account_status from customer_data,
+    used to break the FTD Count row down by status.
+
+    Like last_successful_deposit, this is a LIVE snapshot column - an
+    account that was active last month and is closed today shows as
+    closed in every cohort it appears in. The breakdown therefore
+    describes those cohorts as they stand now, not as they were during
+    the month they were acquired.
+
+    MAX() picks one value deterministically if customer_data ever holds
+    more than one row per key, for the same reason the deposit lifecycle
+    query aggregates: an un-aggregated join would fan out and inflate
+    every count rather than erroring.
+
+    A failure here degrades to no breakdown at all - the FTD Count row
+    stays a plain row with nothing to expand - rather than taking the
+    dashboard down.
+    """
+    conn = get_healthy_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            SELECT
+                "{CUSTOMER_DATA_JOIN_KEY}"::text AS player_key,
+                MAX("account_status") AS account_status
+            FROM "customer_data"
+            GROUP BY 1
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.warning(
+            f"Couldn't load account statuses ({e}) - the FTD Count row won't "
+            "have a status breakdown. The rest of the dashboard is unaffected."
+        )
+        return pd.DataFrame(columns=["player_key", "account_status"])
+
+
+PARTNER_ID_HEADER = "partner id"
+PARTNER_NAME_HEADER = "partner name"
+
+
+def cell_text(value):
+    """
+    A spreadsheet cell as a trimmed string, with blanks as "".
+
+    Written in plain Python rather than as .astype(str).str.strip()
+    because .astype(str) NO LONGER turns NaN into the string "nan" in
+    current pandas - it leaves a float NaN in place, and the next .isdigit()
+    on it raises AttributeError. This sheet has blank spacer rows, so
+    that path is hit every single load. Doing the conversion here makes
+    the result independent of which pandas string-dtype behaviour is in
+    effect on the deployment.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none"} else text
+
+
+@st.cache_data(ttl=3600)
+def load_partner_names():
+    """
+    Returns (mapping, note) where mapping is {partner_id_as_str: name}
+    and note is a short string to show the user (or None).
+
+    The note is RETURNED rather than rendered here because this function
+    is cached: st.* calls inside a cached function only run on a cache
+    miss, so a warning written here would appear once and then silently
+    vanish on every later rerun - exactly when it's still true.
+
+    Cached for an hour rather than the 10 minutes the database queries
+    use - a partner list changes when someone signs a new affiliate, not
+    every few minutes, and this is the one load that reaches outside
+    Supabase.
+
+    Reading strategy, and why it isn't just read_csv with default args:
+      - headers=0 tells gviz to treat EVERY row as data. Left to itself
+        it guesses a header row, and this sheet's row 1 is a merged
+        month banner rather than headers, so its guess is wrong.
+      - The real header row is then FOUND by scanning for a cell reading
+        "Partner ID", instead of assuming a fixed row number. Rows get
+        inserted above headers in a working spreadsheet, and a fixed
+        offset would break silently the first time that happens.
+      - Column positions come from that header row too, so the mapping
+        survives someone inserting a column before Partner Name.
+      - Only rows whose ID is all digits are kept, which drops the blank
+        spacer rows and the "NON AFF TOTAL" style subtotal lines without
+        needing to know what they say.
+
+    Duplicate Partner IDs keep the FIRST name in sheet order. The sheet
+    does contain them, so this needs a stated rule rather than whichever
+    row happens to be written last - first-in-sheet-order is stable and
+    inspectable. Deliberately silent: it's a standing property of the
+    sheet, not a per-load problem. The note is reserved for failures
+    that leave the mapping unusable.
+
+    Every ID is keyed as a STRING. Partner ID is bigint in Postgres and
+    may arrive from the sheet as either int or text, and a dtype
+    mismatch here would produce no matches at all rather than an error.
+    """
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{PARTNER_NAMES_SHEET_ID}"
+        f"/gviz/tq?tqx=out:csv&headers=0&sheet={PARTNER_NAMES_SHEET_TAB}"
+    )
+    try:
+        raw = pd.read_csv(url, dtype=str, header=None)
+    except Exception as e:
+        # Most likely cause by a wide margin is the sheet not being
+        # link-shared, in which case Google serves a sign-in page and
+        # the CSV parse chokes on HTML. The exception text is included
+        # because the type alone was not enough to diagnose this last
+        # time.
+        return {}, (
+            f"Couldn't read partner names ({type(e).__name__}: {e}) - showing "
+            "Partner IDs. Check the sheet is shared as 'Anyone with the link' "
+            f"and that a tab named '{PARTNER_NAMES_SHEET_TAB}' exists."
+        )
+
+    if raw.empty or raw.shape[1] < 2:
+        return {}, (
+            f"Tab '{PARTNER_NAMES_SHEET_TAB}' has fewer than two columns - "
+            "showing Partner IDs."
+        )
+
+    # Locate the header row and the two columns within it.
+    id_col, name_col, header_idx = 0, 1, -1
+    for i in range(min(len(raw), 30)):
+        cells = [cell_text(v).lower() for v in raw.iloc[i]]
+        if PARTNER_ID_HEADER in cells:
+            header_idx = i
+            id_col = cells.index(PARTNER_ID_HEADER)
+            name_col = (
+                cells.index(PARTNER_NAME_HEADER)
+                if PARTNER_NAME_HEADER in cells
+                else id_col + 1
+            )
+            break
+
+    # header_idx == -1 means no header was found; fall back to columns A
+    # and B over the whole sheet. The all-digits filter below makes that
+    # safe - a stray header row simply fails to match and is skipped.
+    body = raw.iloc[header_idx + 1:] if header_idx >= 0 else raw
+    if name_col >= raw.shape[1]:
+        return {}, (
+            f"Couldn't find a 'Partner Name' column in tab "
+            f"'{PARTNER_NAMES_SHEET_TAB}' - showing Partner IDs."
+        )
+
+    ids = [cell_text(v) for v in body.iloc[:, id_col]]
+    names = [cell_text(v) for v in body.iloc[:, name_col]]
+
+    # Duplicate Partner IDs keep the FIRST name in sheet order. Not
+    # surfaced to the user - it's a known, accepted property of the
+    # sheet rather than something to act on each time the app loads.
+    mapping = {}
+    for partner_id, name in zip(ids, names):
+        if not partner_id.isdigit() or not name:
+            continue
+        mapping.setdefault(partner_id, name)
+
+    if not mapping:
+        return {}, (
+            f"No Partner ID / Partner Name pairs found in tab "
+            f"'{PARTNER_NAMES_SHEET_TAB}' - showing Partner IDs."
+        )
+
+    return mapping, None
+
+
+def partner_display_name(partner_id, partner_names):
+    """
+    The name for a Partner ID, falling back to the ID itself when the
+    sheet has no entry for it.
+
+    Falling back to the raw ID rather than to a blank or "Unknown" is
+    deliberate: an unmapped partner stays identifiable and actionable
+    (you can go look it up), and a table full of "Unknown" rows would
+    collapse several distinct partners into one indistinguishable label.
+    """
+    if pd.isna(partner_id):
+        return partner_id
+    return partner_names.get(str(partner_id).strip(), str(partner_id))
+
+
 def allocate_fixed_monthly_charge(full_df, fixed_charge_amount):
     """
     Allocates a flat pool (fixed_charge_amount, e.g. £3,500) PER FTD
@@ -293,6 +654,56 @@ def month_sort_key(mm_yy):
 
 
 # ── AGGREGATION ───────────────────────────────────────────────────────
+
+
+# ── ACCOUNT STATUS BREAKDOWN (FTD Count detail rows) ─────────────────
+
+# Maps the lowercased, trimmed customer_data.account_status value to its
+# display row. Anything not listed lands in OTHER_STATUS_LABEL rather
+# than being dropped, so the detail rows always sum to the FTD Count row
+# above them - a status nobody anticipated shows up as a visible bucket
+# instead of a silent shortfall.
+ACCOUNT_STATUS_BUCKETS = {
+    "active": "  Active",
+    "suspended": "  Suspended",
+    "closed": "  Closed",
+    "blocked": "  Blocked",
+}
+NO_STATUS_LABEL = "  No status recorded"
+OTHER_STATUS_LABEL = "  Other status"
+ACCOUNT_STATUS_ROW_ORDER = list(ACCOUNT_STATUS_BUCKETS.values()) + [
+    NO_STATUS_LABEL,
+    OTHER_STATUS_LABEL,
+]
+
+# The buckets that get their own sidebar checkbox, in display order.
+# OTHER_STATUS_LABEL is deliberately absent: it's a residual bucket for
+# statuses nobody anticipated, so it has no checkbox and is ALWAYS
+# included. Giving an unknown value its own toggle would invite dropping
+# data without knowing what was dropped, and defaulting it to off would
+# hide rows silently.
+SELECTABLE_STATUS_LABELS = list(ACCOUNT_STATUS_BUCKETS.values()) + [NO_STATUS_LABEL]
+
+
+def bucket_account_status(series):
+    """
+    Normalises a raw account_status column to display row labels.
+
+    NULL, NaN and whitespace-only values all become NO_STATUS_LABEL -
+    "" and NULL mean the same thing here, and treating them separately
+    would split one real bucket across two rows. Matching is done on the
+    lowercased, trimmed value so "Active", "active " and "ACTIVE" don't
+    become three different statuses.
+    """
+    def to_label(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return NO_STATUS_LABEL
+        text = str(value).strip().lower()
+        if not text or text in {"nan", "none", "null"}:
+            return NO_STATUS_LABEL
+        return ACCOUNT_STATUS_BUCKETS.get(text, OTHER_STATUS_LABEL)
+
+    return series.map(to_label)
 
 
 def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
@@ -413,6 +824,46 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
 
     # ── Volume ──
     rows["FTD Count"] = ftd_count
+
+    # FTD Count detail rows, present only if the Account Status column
+    # was attached upstream (it isn't if the status query failed).
+    #
+    # These sum the SAME "FTD Count" column the parent row does, just
+    # partitioned by status, rather than counting distinct accounts.
+    # That matters: "FTD Count" is 1 on EVERY one of an account's
+    # FTD-month commission rows (see allocate_fixed_monthly_charge()),
+    # so a distinct-account breakdown would not add up to the parent
+    # row. Partitioning the parent's own rows makes the details
+    # reconcile by construction, whatever the parent does.
+    if "Account Status" in df.columns:
+        status_buckets = bucket_account_status(df["Account Status"])
+        status_counts = (
+            df.assign(_status_bucket=status_buckets)
+            .groupby(["_status_bucket", "FTD Month"])["FTD Count"]
+            .sum()
+            .unstack(fill_value=0)
+            .reindex(columns=months, fill_value=0)
+        )
+        status_detail_rows = []
+        for label in ACCOUNT_STATUS_ROW_ORDER:
+            series = status_counts.loc[label] if label in status_counts.index else None
+            # "Other status" is clutter when nothing falls into it, but
+            # the four named statuses stay visible at zero - a cohort
+            # with no closed accounts is a real and useful reading,
+            # whereas an empty Other bucket says nothing.
+            if series is None:
+                if label == OTHER_STATUS_LABEL:
+                    continue
+                series = pd.Series(0, index=months)
+            elif label == OTHER_STATUS_LABEL and not series.any():
+                continue
+            rows[label] = series.reindex(months).fillna(0)
+            status_detail_rows.append(label)
+
+        if status_detail_rows:
+            total_rows.add("FTD Count")
+            sections.append(("FTD Count", status_detail_rows))
+
     rows["Deposits"] = deposits
 
     # ── Revenue ──
@@ -481,6 +932,14 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     "cumulative by cohort" line charts. One line per FTD Month cohort,
     x-axis is Relative Month (1 = the cohort's own FTD month, 2 = the
     month after, etc.).
+
+    The four value series (Total GGR, Casino GGR, Sports GGR, Deposits)
+    are all PER PLAYER - each cohort's cumulative total divided by its
+    own FTD Count, the same basis Cumulative Player LTV uses. They're
+    still cumulative; the division removes cohort SIZE from the
+    comparison so a small month and a large month sit on the same scale.
+    Raw cumulative totals are still computed (cum_total_ggr and friends)
+    and can be surfaced by pointing the returned dict back at them.
 
     "Count of Players Depositing" is the one NON-cumulative metric here
     - a retention-style snapshot of how many distinct accounts in that
@@ -565,6 +1024,27 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     per_period["ftd_count"] = per_period["FTD Month"].map(ftd_count_by_cohort)
     per_period["cum_player_ltv"] = (per_period["cum_profit"] / per_period["ftd_count"].replace(0, pd.NA)).fillna(0)
 
+    # Per-player versions of the four value series, on the same basis
+    # Cumulative Player LTV already used: a cohort's running total to
+    # date divided by its own FTD Count. Still cumulative - the division
+    # only removes cohort SIZE from the comparison, so a 40-FTD month
+    # and a 400-FTD month sit on the same scale and the lines say
+    # something about player quality rather than about how much was
+    # spent acquiring that month.
+    #
+    # FTD Count is fixed per cohort (it doesn't vary by relative month),
+    # so this is a division by a constant within each line - the shape
+    # of every curve is unchanged, only its height.
+    for cumulative_col, per_player_col in [
+        ("cum_total_ggr", "cum_total_ggr_pp"),
+        ("cum_casino_ggr", "cum_casino_ggr_pp"),
+        ("cum_sports_ggr", "cum_sports_ggr_pp"),
+        ("cum_deposits", "cum_deposits_pp"),
+    ]:
+        per_period[per_player_col] = (
+            per_period[cumulative_col] / per_period["ftd_count"].replace(0, pd.NA)
+        ).fillna(0)
+
     # Count of Players Depositing - NOT cumulative, distinct accounts
     # with at least one deposit specifically in that relative month.
     depositing = (
@@ -596,10 +1076,10 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
         return source_df.pivot(index="Relative Month", columns="FTD Month", values=value_col).sort_index()
 
     return {
-        "Cumulative Total GGR": pivot_metric(per_period, "cum_total_ggr"),
-        "Cumulative Casino GGR": pivot_metric(per_period, "cum_casino_ggr"),
-        "Cumulative Sports GGR": pivot_metric(per_period, "cum_sports_ggr"),
-        "Cumulative Deposits": pivot_metric(per_period, "cum_deposits"),
+        "Cumulative Total GGR per Player": pivot_metric(per_period, "cum_total_ggr_pp"),
+        "Cumulative Casino GGR per Player": pivot_metric(per_period, "cum_casino_ggr_pp"),
+        "Cumulative Sports GGR per Player": pivot_metric(per_period, "cum_sports_ggr_pp"),
+        "Cumulative Deposits per Player": pivot_metric(per_period, "cum_deposits_pp"),
         "Cumulative Player LTV": pivot_metric(per_period, "cum_player_ltv"),
         "Count of Players Depositing": pivot_metric(depositing, "players_depositing").fillna(0),
         # No .fillna(0) here, unlike every other chart's pivot - a
@@ -614,21 +1094,371 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     }
 
 
-def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
+def to_local_naive_date(series):
     """
-    Groups the (already-filtered) dataframe by group_col (Partner ID,
-    Campaign ID, or Commission ID) and computes each group's LIFETIME
-    Profit and Player LTV, sorted highest-LTV-first.
+    Reduces a timestamp column to a tz-naive calendar date in
+    LOCAL_TIMEZONE, whatever it arrives as.
+
+    Needed because the two timestamps feeding the retention chart come
+    from different places and don't agree on tz-awareness: the view's
+    "First deposit date" is timestamptz, while customer_data's
+    last_successful_deposit lands naive. pandas refuses to compare or
+    subtract across that boundary (TypeError: Invalid comparison between
+    dtype=datetime64[ns, UTC] and Timestamp) rather than guessing, which
+    is the right call - the two interpretations are a day apart for
+    anything near midnight.
+
+    Rules applied here:
+      - tz-AWARE input is converted to LOCAL_TIMEZONE before the date is
+        taken, so an FTD at 00:30 BST counts as that day rather than the
+        one before.
+      - tz-NAIVE input is assumed to ALREADY be local wall-clock time
+        (it comes from Drive CSV exports of a UK-facing system) and is
+        left where it is. Localising it to UTC first and converting
+        would shift it by an hour in summer, in the wrong direction.
+      - mixed UTC offsets in one column (which a London-local column
+        spanning a DST change will have) make pandas RAISE
+        "Mixed timezones detected" rather than return something usable,
+        so that's caught and re-parsed via UTC. Verified by test rather
+        than assumed - an earlier version of this checked the returned
+        dtype instead, and the check was unreachable.
+    """
+    try:
+        parsed = pd.to_datetime(series, errors="coerce")
+    except ValueError:
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    if not pd.api.types.is_datetime64_any_dtype(parsed):
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+        parsed = parsed.dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
+    return parsed.dt.normalize()
+
+
+def build_relative_day_retention(
+    lifecycle_df,
+    cohort_months=None,
+    window=RELATIVE_DAY_WINDOW,
+    min_observed=MIN_OBSERVED_ACCOUNTS_PER_POINT,
+    min_coverage=MIN_COHORT_COVERAGE_PER_POINT,
+    as_of=None,
+):
+    """
+    Builds "% of Players Still Depositing" by RELATIVE DAY (1-window),
+    one line per FTD Month cohort - the same cohort grouping and the
+    same MM/YY labels as every other chart in this app, so colours and
+    legend order stay consistent.
+
+    Day 1 is the account's OWN FTD day. An account counts as "still
+    depositing" at day N if its last successful deposit falls on or
+    after its own day N.
+
+    THIS IS A SURVIVAL CURVE, NOT A PER-DAY SNAPSHOT. customer_data's
+    last_successful_deposit is ONE timestamp per account, not a deposit
+    event log, so "did this account deposit ON day N" is not answerable
+    from it. What IS answerable is "was this account's deposit lifetime
+    still running at day N". Concretely, versus the monthly
+    "% of Players Still Depositing" chart above:
+
+      - Monthly chart: an account with no deposit in relative month 3
+        but one in month 4 is absent from month 3 and present in month
+        4. That line can go back up.
+      - This chart: an account whose last deposit is day 25 counts as
+        "still depositing" on every day 1-25, including days it made no
+        deposit at all. This line can only go down.
+
+    For a 30-day window that's the more readable chart regardless - a
+    literal "% depositing ON day N" would fall to near-zero by day 3,
+    since very few accounts deposit daily.
+
+    THE DENOMINATOR IS PER-DAY, NOT PER-COHORT. At day N, only accounts
+    that have actually had N days elapsed since their own FTD are
+    counted. This matters more than it sounds: a monthly cohort spans up
+    to 31 FTD dates, so mid-month a single cohort contains accounts with
+    wildly different observation windows. Using the whole cohort as a
+    fixed denominator would make every young cohort's curve slope
+    downward purely because its late-in-the-month signups haven't had
+    time to deposit again yet - a censoring artefact that looks
+    identical to real churn. This is the day-level equivalent of the
+    NaN-not-zero handling in build_relative_month_series().
+
+    That per-day denominator has a cost, which min_coverage exists to
+    contain: as N grows, the eligible set for a cohort still inside its
+    own window shrinks toward the accounts that signed up EARLIEST in
+    the month. Each step right then swaps in a different population
+    rather than following one forward, and the line can rise - reading
+    as accounts returning when none did. A point is therefore dropped
+    unless at least min_coverage of the cohort is still observable, so
+    every plotted point describes substantially the whole cohort.
+    min_observed drops points for the separate reason of being too few
+    accounts to be stable at all.
+
+    Accounts with no recorded last_successful_deposit are DROPPED, not
+    counted. Two consequences to keep in mind: every cohort's
+    denominator here is "accounts with a recorded last deposit" rather
+    than its FTD Count, so cohort sizes won't tie back to the table
+    above; and if those NULLs represent a customer_data coverage gap
+    rather than genuinely inactive accounts, retention is overstated by
+    exactly the accounts most likely to have lapsed. The call site
+    reports how many were dropped so that's visible rather than assumed.
+
+    An account whose last deposit is dated BEFORE its own FTD is a data
+    inconsistency rather than a missing value, so it's clamped to the
+    FTD date (i.e. counted as day-1-only) rather than dropped.
+
+    as_of defaults to today, and is a parameter mainly so this is
+    testable against a fixed date.
+
+    Returns a wide DataFrame - index "Relative Day", one column per FTD
+    Month, values 0-100. NaN is left in deliberately (no .fillna(0)) for
+    (cohort, day) combinations that either haven't happened yet or fall
+    below min_observed, so Altair breaks the line rather than drawing a
+    0% point that reads as total churn.
+    """
+    empty = pd.DataFrame(index=pd.RangeIndex(1, window + 1, name="Relative Day"))
+    if lifecycle_df.empty:
+        return empty
+
+    d = lifecycle_df.dropna(subset=["ftd_at"]).copy()
+    if d.empty:
+        return empty
+
+    # Both reduced to tz-naive local calendar dates before anything is
+    # compared or subtracted - see to_local_naive_date(). The two
+    # columns come from different sources and disagree on tz-awareness,
+    # which pandas treats as an error rather than silently picking an
+    # interpretation.
+    d["ftd_date"] = to_local_naive_date(d["ftd_at"])
+    d["last_date"] = to_local_naive_date(d["last_deposit_at"])
+    d = d.dropna(subset=["ftd_date"])
+
+    # No recorded last deposit -> removed entirely, so these accounts
+    # appear in no denominator at all. See docstring for what that does
+    # to the interpretation of the curve.
+    d = d.dropna(subset=["last_date"])
+    if d.empty:
+        return empty
+
+    # Last deposit predating the account's own FTD is an inconsistency,
+    # not a missing value - clamped rather than dropped.
+    d.loc[d["last_date"] < d["ftd_date"], "last_date"] = d["ftd_date"]
+
+    # Same MM/YY cohort label the rest of the app uses, derived here from
+    # the FTD timestamp. If the ROI dash view derives its own "FTD Month"
+    # any other way (e.g. from an Affilka-supplied month field with a
+    # different timezone or cutoff), a handful of accounts near a month
+    # boundary could land in a different cohort here than they do in the
+    # table above.
+    d["FTD Month"] = d["ftd_date"].dt.strftime("%m/%y")
+
+    if cohort_months is not None:
+        d = d[d["FTD Month"].isin(cohort_months)]
+    if d.empty:
+        return empty
+
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+
+    d["last_relative_day"] = (d["last_date"] - d["ftd_date"]).dt.days + 1
+    d["days_observed"] = (as_of_ts - d["ftd_date"]).dt.days + 1
+
+    records = []
+    for month, cohort in d.groupby("FTD Month"):
+        observed = cohort["days_observed"].to_numpy()
+        last_day = cohort["last_relative_day"].to_numpy()
+        cohort_size = len(cohort)
+        for day in range(1, window + 1):
+            eligible = observed >= day
+            n_eligible = int(eligible.sum())
+            coverage = n_eligible / cohort_size if cohort_size else 0.0
+            # Two independent reasons to drop a point: too few accounts
+            # left to be stable (min_observed), or too small a SHARE of
+            # the cohort left for the point to still describe that
+            # cohort rather than an early-signing slice of it
+            # (min_coverage). The second is what stops a partial
+            # cohort's line rising - see MIN_COHORT_COVERAGE_PER_POINT.
+            if n_eligible < min_observed or coverage < min_coverage:
+                pct = float("nan")
+            else:
+                still = int((last_day[eligible] >= day).sum())
+                pct = 100.0 * still / n_eligible
+            records.append({"FTD Month": month, "Relative Day": day, "pct": pct})
+
+    long = pd.DataFrame(records)
+    wide = long.pivot(index="Relative Day", columns="FTD Month", values="pct").astype(float)
+    return wide.reindex(range(1, window + 1)).sort_index()
+
+
+# Columns summed as-is when flattening the view to one row per
+# (account, relative month) for the LTV model export. Everything else in
+# the export is derived from these.
+MODEL_EXPORT_SUM_COLUMNS = [
+    "Deposits sum", "Deposits count",
+    "Casino GGR", "SB GGR", "SB Correction",
+    "Free Spins Payout", "Free Bet Payout", "BOG Bonus", "Lucky Bonus",
+    "RGD Duty", "GBD Duty", "HBLB Levy", "Statutory Levy",
+    "Data Provider Fees",
+    "Casino Provider Fee", "Live Casino Provider Fee", "Virtuals Provider Fee",
+    "Trading Adjustments", "Estimated Processing Fees", "Admin/Platform Fees",
+    "Actual_Fixed_Fee", "Actual_RS", "Allocated Fixed Monthly Charge",
+]
+
+
+def hash_account_id(account_id):
+    """
+    A stable pseudonym for an account ID.
+
+    PSEUDONYMISATION, NOT ANONYMISATION - be clear-eyed about this. The
+    hash is deterministic and account IDs come from a small enumerable
+    space, so anyone holding the ID list can rebuild the mapping by
+    hashing every candidate. It stops a raw customer identifier being
+    copied into a file that leaves the building; it does not make the
+    file safe to publish. Treat an export as confidential either way.
+    """
+    return hashlib.sha256(str(account_id).encode("utf-8")).hexdigest()[:16]
+
+
+def cohort_months_elapsed(ftd_month, as_of):
+    """Whole calendar months from an MM/YY cohort label to as_of."""
+    year, month = month_sort_key(ftd_month)
+    if (year, month) == (0, 0):
+        return -1
+    return (as_of.year * 12 + as_of.month) - (year * 12 + month)
+
+
+def build_ltv_model_export(base_df, lifecycle_df, min_months_observed, max_accounts=0, as_of=None):
+    """
+    Flattens the ROI dash to ONE ROW PER (account, relative month) for
+    survival-weighted LTV modelling, and returns (dataframe, note).
+
+    Per-relative-month grain is the entire point. Lifetime totals can
+    only support a model of average player value, which forces the
+    assumption that a marginal retained player earns what an average one
+    does - the assumption most likely to be wrong and most likely to
+    flatter the answer. Month-by-month rows let that be derived instead.
+
+    Only cohorts with at least min_months_observed whole months since
+    their FTD month are included, so every account has had a comparable
+    chance to earn out. Mixing a 1-month-old cohort into a survival
+    model biases every curve downward at exactly the tail the model
+    depends on.
+
+    Both profit definitions are emitted (incl. and excl. affiliate
+    costs) rather than whichever the sidebar toggle currently says, so
+    the export doesn't silently inherit a UI setting - a model built on
+    the wrong one would be wrong in a way that's invisible in the file.
+
+    FTD Count is NOT summed: it is 1 on every one of an account's
+    commission rows (see allocate_fixed_monthly_charge()), so summing it
+    counts multi-commission accounts several times. An is_ftd_month flag
+    derived from Relative Month == 1 carries the same information
+    without that trap.
+
+    max_accounts > 0 takes a reproducible random sample of ACCOUNTS
+    (never of rows - sampling rows would tear an account's history apart
+    and make survival meaningless). Seeded, so the same request gives
+    the same file.
+    """
+    as_of = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.today()
+
+    d = base_df[base_df["Relative Month"] >= 1].copy()
+    if d.empty:
+        return pd.DataFrame(), "No rows with a Relative Month of 1 or more."
+
+    elapsed = d["FTD Month"].map(lambda m: cohort_months_elapsed(m, as_of))
+    d = d[elapsed >= min_months_observed]
+    if d.empty:
+        return pd.DataFrame(), (
+            f"No cohort has {min_months_observed}+ whole months of history yet."
+        )
+
+    if max_accounts and d["Original player ID"].nunique() > max_accounts:
+        sampled = (
+            pd.Series(d["Original player ID"].unique())
+            .sample(n=max_accounts, random_state=42)
+        )
+        d = d[d["Original player ID"].isin(set(sampled))]
+
+    present = [c for c in MODEL_EXPORT_SUM_COLUMNS if c in d.columns]
+    grouped = (
+        d.groupby(["Original player ID", "FTD Month", "Relative Month", "Activity Month"], dropna=False)[present]
+        .sum()
+        .reset_index()
+    )
+
+    # Partner is taken per ACCOUNT, not per row - an account can sit
+    # under several commissions, and a row-level partner would let one
+    # account appear under two partners in the same month.
+    partner_by_account = (
+        d.sort_values("Partner ID").groupby("Original player ID")["Partner ID"].first()
+    )
+    grouped["partner_id"] = grouped["Original player ID"].map(partner_by_account)
+
+    out = pd.DataFrame({
+        "account_hash": grouped["Original player ID"].map(hash_account_id),
+        "partner_id": grouped["partner_id"],
+        "ftd_month": grouped["FTD Month"],
+        "activity_month": grouped["Activity Month"],
+        "relative_month": grouped["Relative Month"],
+        "is_ftd_month": (grouped["Relative Month"] == 1).astype(int),
+    })
+
+    def g(col):
+        return grouped[col] if col in grouped.columns else 0.0
+
+    out["deposits_sum"] = g("Deposits sum")
+    out["deposits_count"] = g("Deposits count")
+    out["casino_ggr"] = g("Casino GGR")
+    out["sports_ggr"] = g("SB GGR") + g("SB Correction")
+    out["total_ggr"] = out["casino_ggr"] + out["sports_ggr"]
+    out["total_bonus"] = g("Free Spins Payout") + g("Free Bet Payout") + g("BOG Bonus") + g("Lucky Bonus")
+    out["total_taxes_duties"] = g("RGD Duty") + g("GBD Duty") + g("HBLB Levy") + g("Statutory Levy")
+    out["total_other_fees"] = (
+        g("Data Provider Fees") + g("Casino Provider Fee") + g("Live Casino Provider Fee")
+        + g("Virtuals Provider Fee") + g("Trading Adjustments")
+        + g("Estimated Processing Fees") + g("Admin/Platform Fees")
+    )
+    fixed_fee, rev_share, fmc = g("Actual_Fixed_Fee"), g("Actual_RS"), g("Allocated Fixed Monthly Charge")
+    out["affiliate_costs"] = fixed_fee + rev_share + fmc + (fixed_fee + rev_share + fmc) * 0.2
+    out["profit_excl_affiliate"] = out["total_ggr"] - out["total_bonus"] - out["total_taxes_duties"] - out["total_other_fees"]
+    out["profit_incl_affiliate"] = out["profit_excl_affiliate"] - out["affiliate_costs"]
+
+    # Account-level survival facts, repeated on every row of that
+    # account so the file is usable without a second join.
+    if lifecycle_df is not None and not lifecycle_df.empty:
+        life = lifecycle_df.dropna(subset=["ftd_at"]).copy()
+        life["ftd_date"] = to_local_naive_date(life["ftd_at"])
+        life["last_date"] = to_local_naive_date(life["last_deposit_at"])
+        life = life.dropna(subset=["ftd_date"])
+        life["player_key"] = life["player_id"].astype(str)
+        life = life.drop_duplicates(subset=["player_key"], keep="first").set_index("player_key")
+
+        keys = grouped["Original player ID"].astype(str)
+        ftd_dates = keys.map(life["ftd_date"])
+        last_dates = keys.map(life["last_date"])
+        out["ftd_date"] = ftd_dates.dt.strftime("%Y-%m-%d")
+        out["last_deposit_date"] = last_dates.dt.strftime("%Y-%m-%d")
+        out["days_ftd_to_last_deposit"] = (last_dates - ftd_dates).dt.days
+
+    out = out.sort_values(["account_hash", "relative_month"]).reset_index(drop=True)
+    note = (
+        f"{len(out):,} rows, {out['account_hash'].nunique():,} accounts, "
+        f"cohorts {min_months_observed}+ months old."
+    )
+    return out, note
+
+
+def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv):
+    """
+    Per-group sums of every component the ranking tables need, plus the
+    resulting Profit. Factored out so the lifetime columns and the
+    ARPU-after-3-months column are computed by the SAME code on two
+    different slices of data - if the profit formula ever changes, it
+    can't drift between the two.
 
     Affiliate Costs here includes "Allocated Fixed Monthly Charge" -
     now that it's genuinely row-level (see allocate_fixed_monthly_charge()),
     summing it by group_col is exactly as valid as summing Casino GGR by
     group_col - matching Actual_Fixed_Fee and Actual_RS, which were
     always genuinely row-level in the source view.
-
-    Returns a DataFrame with one row per group_col value, sorted by
-    Player LTV descending (highest LTV first, matching "top to bottom"
-    ranking).
     """
     grouped = df.groupby(group_col)
 
@@ -664,39 +1494,117 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv):
 
     if include_affiliate_costs_in_ltv:
         profit = total_ggr - total_bonus - sum_of_deductions - affiliate_costs
-        profit_label = "Profit (incl. Affiliate Costs)"
-        ltv_label = "Player LTV (incl. Affiliate Costs)"
     else:
         profit = total_ggr - total_bonus - sum_of_deductions
+
+    return {
+        "ftd_count": ftd_count,
+        "total_ggr": total_ggr,
+        "total_bonus": total_bonus,
+        "sum_of_deductions": sum_of_deductions,
+        "affiliate_costs": affiliate_costs,
+        "profit": profit,
+    }
+
+
+def immature_ftd_months(df, maturity_months=ARPU_MATURITY_MONTHS):
+    """
+    The N most recent FTD Month cohorts in the dataset - the ones too
+    young to have had time to earn out, which ARPU after N months
+    excludes.
+
+    Computed from the FULL dataset rather than from whatever the sidebar
+    filters currently leave in view, so every partner is judged against
+    the same calendar cutoff. Deriving it from the filtered frame would
+    mean a partner whose newest cohort is 03/26 gets 12/25-03/26 cut
+    while a partner still acquiring gets 06/26-08/26 cut - different
+    maturity windows, and the resulting ARPUs wouldn't be comparable,
+    which is the entire point of a ranking table.
+    """
+    months = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key, reverse=True)
+    return set(months[:maturity_months])
+
+
+def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, excluded_ftd_months=frozenset()):
+    """
+    Groups the (already-filtered) dataframe by group_col (Partner ID,
+    Campaign ID, or Commission ID) and computes each group's LIFETIME
+    totals, plus ARPU after N months, sorted highest-ARPU-first.
+
+    ARPU after N months is each group's Profit divided by its FTD Count
+    with the N most recent FTD-month cohorts REMOVED FROM BOTH. Those
+    cohorts are counted in the denominator the moment they sign up but
+    have barely started contributing to the numerator, so including them
+    drags down whichever partner is currently acquiring hardest - which
+    is precisely backwards for a table meant to rank partner quality.
+    Removing them from both sides puts every group on cohorts that have
+    had at least N months to earn out.
+
+    NOTE the other columns are still LIFETIME figures across every
+    cohort, so ARPU deliberately does NOT equal this table's own Profit
+    divided by its own FTD Count. That's the point - they answer
+    different questions - but it's why the tab carries a caption saying
+    so.
+
+    A group whose every cohort is inside the excluded window has no
+    mature FTDs at all, and gets NaN rather than 0 - a genuine "not
+    measurable yet", displayed as n/a and sorted last, not a zero that
+    would read as a group that earned nothing.
+
+    Returns (result, profit_label, arpu_label).
+    """
+    lifetime = summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv)
+
+    mature_df = df[~df["FTD Month"].isin(excluded_ftd_months)]
+    if mature_df.empty:
+        arpu = pd.Series(float("nan"), index=lifetime["ftd_count"].index)
+    else:
+        mature = summarise_group_economics(mature_df, group_col, include_affiliate_costs_in_ltv)
+        mature_ftds = mature["ftd_count"].replace(0, pd.NA)
+        arpu = (mature["profit"] / mature_ftds).reindex(lifetime["ftd_count"].index)
+        arpu = pd.to_numeric(arpu, errors="coerce")
+
+    if include_affiliate_costs_in_ltv:
+        profit_label = "Profit (incl. Affiliate Costs)"
+        arpu_label = f"ARPU after {ARPU_MATURITY_MONTHS} months (incl. Affiliate Costs)"
+    else:
         profit_label = "Profit (excl. Affiliate Costs)"
-        ltv_label = "Player LTV (excl. Affiliate Costs)"
-    player_ltv = (profit / ftd_count.replace(0, pd.NA)).fillna(0)
+        arpu_label = f"ARPU after {ARPU_MATURITY_MONTHS} months (excl. Affiliate Costs)"
 
     result = pd.DataFrame({
-        "FTD Count": ftd_count,
-        "Total GGR": total_ggr,
-        "Total Bonus": total_bonus,
-        "Sum of Deductions": sum_of_deductions,
-        "Affiliate Costs": affiliate_costs,
-        profit_label: profit,
-        ltv_label: player_ltv,
+        "FTD Count": lifetime["ftd_count"],
+        "Total GGR": lifetime["total_ggr"],
+        "Total Bonus": lifetime["total_bonus"],
+        "Sum of Deductions": lifetime["sum_of_deductions"],
+        "Affiliate Costs": lifetime["affiliate_costs"],
+        profit_label: lifetime["profit"],
+        arpu_label: arpu,
     })
-    result = result.sort_values(ltv_label, ascending=False)
+    result = result.sort_values(arpu_label, ascending=False, na_position="last")
     result.index.name = group_col
-    return result, profit_label, ltv_label
+    return result, profit_label, arpu_label
 
 
-def format_ranking_table(result, profit_label, ltv_label):
+def format_ranking_table(result, profit_label, arpu_label):
     """
     Currency-formats every column except FTD Count (a plain integer
     count), returning a display-ready copy. Same .astype(object)
     upfront pattern as the cohort table, for the same reason (newer
     pandas rejects writing formatted strings into a float64 column).
+
+    A NaN ARPU renders as "n/a" rather than the blank format_currency()
+    would give, since a blank cell in a currency column reads as zero at
+    a glance - and "this group has no cohort old enough to measure" is a
+    different statement from "this group earned nothing".
     """
     display = result.astype(object)
     for col in display.columns:
         if col == "FTD Count":
             display[col] = result[col].apply(lambda v: f"{v:,.0f}")
+        elif col == arpu_label:
+            display[col] = result[col].apply(
+                lambda v: "n/a" if pd.isna(v) else format_currency(v)
+            )
         else:
             display[col] = result[col].apply(format_currency)
     return display
@@ -714,10 +1622,10 @@ def format_pct(v):
     return f"{v:.1%}"
 
 
-def render_cumulative_chart(df_wide, is_percent=False):
+def render_cumulative_chart(df_wide, is_percent=False, x_field="Relative Month", y_title=None, x_zero=False):
     """
-    Renders a wide-format DataFrame (index = Relative Month, one column
-    per FTD Month cohort) as a line chart with an auto-scaling Y-axis -
+    Renders a wide-format DataFrame (index = x_field, one column per FTD
+    Month cohort) as a line chart with an auto-scaling Y-axis -
     st.line_chart() always forces the Y-axis to start at 0 with no way
     to override that, which compresses later, higher-value data toward
     the top of the chart and hides smaller month-to-month movement.
@@ -729,9 +1637,19 @@ def render_cumulative_chart(df_wide, is_percent=False):
     axis anchored at zero - unlike the currency charts, 0-100% is a
     natural, meaningful bound worth keeping visible rather than
     auto-scaling away.
+
+    x_field names the index column, so the same renderer handles both
+    the "Relative Month" series and the "Relative Day" retention chart.
+
+    Every series here starts at period 1, so the x-axis is pinned to the
+    data's own first and last period. zero=False alone is NOT enough to
+    achieve that: Vega-Lite's "nice" rounding is on by default and will
+    happily extend a 1-30 domain down to 0 to land on a round number,
+    which is what put the 0 tick there in the first place. nice=False
+    plus an explicit domain is what actually removes it.
     """
     df_long = df_wide.reset_index().melt(
-        id_vars="Relative Month", var_name="FTD Month", value_name="value"
+        id_vars=x_field, var_name="FTD Month", value_name="value"
     )
     # Altair sorts a nominal color field alphabetically as strings by
     # default (e.g. "01/26" before "11/25", since "0" < "1"
@@ -740,24 +1658,37 @@ def render_cumulative_chart(df_wide, is_percent=False):
     # legend (and matching line/point colors) true chronological order
     # instead.
     cohort_order = sorted(df_long["FTD Month"].dropna().unique(), key=month_sort_key)
+    if y_title is None:
+        y_title = "% still depositing" if is_percent else ""
     y_axis = alt.Y(
         "value:Q",
-        title="% still depositing" if is_percent else "",
+        title=y_title,
         scale=alt.Scale(zero=True) if is_percent else alt.Scale(zero=False),
         axis=alt.Axis(format=".0f") if is_percent else alt.Axis(),
     )
+    # Pinned to the data's own range, with nice=False, so the axis
+    # starts at period 1 rather than being rounded down to 0. Guarded
+    # for an empty frame, where min()/max() would be NaN.
+    x_values = pd.to_numeric(df_long[x_field], errors="coerce").dropna()
+    if x_zero or x_values.empty:
+        x_scale = alt.Scale(zero=x_zero)
+    else:
+        x_scale = alt.Scale(
+            zero=False, nice=False, domain=[float(x_values.min()), float(x_values.max())]
+        )
     chart = (
         alt.Chart(df_long)
         .mark_line(point=True)
         .encode(
             x=alt.X(
-                "Relative Month:Q",
-                title="Relative Month",
+                f"{x_field}:Q",
+                title=x_field,
+                scale=x_scale,
                 axis=alt.Axis(tickMinStep=1, format="d"),
             ),
             y=y_axis,
             color=alt.Color("FTD Month:N", title="FTD Month", sort=cohort_order),
-            tooltip=["FTD Month", "Relative Month", "value"],
+            tooltip=["FTD Month", x_field, "value"],
         )
         .properties(height=350)
     )
@@ -848,7 +1779,7 @@ def render_cohort_table_html(table, total_rows, visible_rows):
 
 
 PERCENT_ROWS = {"  Bonus % of GGR"}
-COUNT_ROWS = {"FTD Count"}
+COUNT_ROWS = {"FTD Count"} | set(ACCOUNT_STATUS_ROW_ORDER)
 # Every row not in PERCENT_ROWS or COUNT_ROWS is a currency row -
 # formatting is now driven by exclusion rather than an explicit set,
 # since row labels change dynamically (Profit/LTV's label depends on
@@ -864,6 +1795,37 @@ COUNT_ROWS = {"FTD Count"}
 # Stake rather than Affilka's own stake columns).
 ROW_EXPLANATIONS = {
     "FTD Count": "Source: Affilka API\n\nFTD count direct from Affilka.",
+    "  Active": (
+        "Source: customer_data.account_status\n\n"
+        "The same FTD Count figure as the row above, split by each account's "
+        "account_status AS IT STANDS NOW - not as it was during the month the "
+        "cohort was acquired. account_status is a live snapshot column, so an "
+        "account acquired in Nov-25 and closed last week counts as closed here."
+    ),
+    "  Suspended": (
+        "Source: customer_data.account_status\n\n"
+        "See Active - same basis, current status rather than status at acquisition."
+    ),
+    "  Closed": (
+        "Source: customer_data.account_status\n\n"
+        "See Active - same basis, current status rather than status at acquisition."
+    ),
+    "  Blocked": (
+        "Source: customer_data.account_status\n\n"
+        "See Active - same basis, current status rather than status at acquisition."
+    ),
+    "  No status recorded": (
+        "Source: customer_data.account_status\n\n"
+        "Accounts with no account_status in customer_data, or with a blank one - "
+        "NULL and empty string are the same thing here and share this row. Also "
+        "where accounts land if they have no customer_data row at all."
+    ),
+    "  Other status": (
+        "Source: customer_data.account_status\n\n"
+        "An account_status value that isn't one of the four expected ones. This "
+        "row is hidden when empty, so if it's showing, customer_data holds a "
+        "status worth adding to ACCOUNT_STATUS_BUCKETS."
+    ),
     "Deposits": "Source: Affilka API\n\nDeposits Sum direct from Affilka.",
     "Total GGR": "Casino GGR + SB GGR (SB GGR already includes SB Correction, so it isn't added again separately here).",
     "  Casino GGR": "Source: Affilka API\n\nCasino GGR direct from Affilka.",
@@ -987,6 +1949,29 @@ with st.spinner("Loading data..."):
 # before any Partner/Campaign/Landing Page Type/Commission filtering, not after.
 df["Allocated Fixed Monthly Charge"] = allocate_fixed_monthly_charge(df, FIXED_MONTHLY_CHARGE_AMOUNT)
 
+# Attach account_status so build_cohort_table() can break FTD Count down
+# by it. Attached to the FULL frame before filtering, so the column
+# survives into `filtered` without needing to be re-joined.
+#
+# The match-rate guard matters: if the join key ever stops working,
+# every account maps to NaN and the whole cohort silently reports as
+# "No status recorded", which reads as a genuine finding about the book
+# rather than as a broken join. Dropping the column entirely in that
+# case makes the failure visible as a missing breakdown instead.
+account_status = load_account_status_data()
+if not account_status.empty:
+    status_by_key = account_status.dropna(subset=["player_key"]).set_index("player_key")["account_status"]
+    mapped_status = df["Original player ID"].astype(str).map(status_by_key)
+    if mapped_status.notna().any():
+        df["Account Status"] = mapped_status
+    else:
+        st.warning(
+            "No accounts matched customer_data on "
+            f"{CUSTOMER_DATA_JOIN_KEY}, so the FTD Count status breakdown is "
+            "unavailable - check that it's the same identifier as "
+            "\"Original player ID\"."
+        )
+
 # ── FILTERS ──────────────────────────────────────────────────────────
 
 st.sidebar.header("Filters")
@@ -996,7 +1981,18 @@ campaign_ids = sorted(df["Campaign ID"].dropna().unique().tolist())
 landing_page_types = sorted(df["Landing Page Type"].dropna().unique().tolist())
 commission_ids = sorted(df["Commission ID"].dropna().unique().tolist())
 
-selected_partners = st.sidebar.multiselect("Partner ID", partner_ids)
+partner_names, partner_names_note = load_partner_names()
+if partner_names_note:
+    st.sidebar.caption(partner_names_note)
+
+# format_func shows the name but the widget's VALUES stay Partner IDs,
+# so every downstream filter still compares IDs against the dataframe -
+# the naming is presentation only and can't affect which rows match.
+selected_partners = st.sidebar.multiselect(
+    "Partner",
+    partner_ids,
+    format_func=lambda pid: partner_display_name(pid, partner_names),
+)
 selected_campaigns = st.sidebar.multiselect("Campaign ID", campaign_ids)
 selected_landing_page_types = st.sidebar.multiselect(
     "Landing Page Type",
@@ -1010,6 +2006,38 @@ selected_landing_page_types = st.sidebar.multiselect(
     ),
 )
 selected_commissions = st.sidebar.multiselect("Commission ID", commission_ids)
+
+st.sidebar.divider()
+st.sidebar.caption("Include accounts with status")
+
+# One checkbox per status bucket, all ticked by default, so the default
+# view is the whole book and unticking is an explicit narrowing rather
+# than something the app does on your behalf.
+#
+# There is no checkbox for "Other status" - see
+# SELECTABLE_STATUS_LABELS. Those rows are always included.
+_status_column_present = "Account Status" in df.columns
+if not _status_column_present:
+    st.sidebar.caption("Unavailable - account statuses didn't load.")
+
+included_status_labels = {
+    label
+    for label in SELECTABLE_STATUS_LABELS
+    if st.sidebar.checkbox(
+        label.strip(),
+        value=True,
+        key=f"status_{label.strip()}",
+        disabled=not _status_column_present,
+        help=(
+            "Accounts with no account_status in customer_data, a blank one, "
+            "or no customer_data row at all. Untick with care: a broken join "
+            "would land accounts here rather than erroring, so this bucket "
+            "can contain accounts that are perfectly active."
+            if label == NO_STATUS_LABEL
+            else None
+        ),
+    )
+}
 
 st.sidebar.divider()
 include_affiliate_costs = st.sidebar.checkbox(
@@ -1062,6 +2090,31 @@ if selected_landing_page_types:
 if selected_commissions:
     filtered = filtered[filtered["Commission ID"].isin(selected_commissions)]
 
+# Applied BEFORE the outlier exclusion below, so the 5%/95% thresholds
+# are percentiles of the population actually being analysed rather than
+# of one that includes accounts already destined to be removed.
+#
+# Status is an account-level fact repeated on every row of that account,
+# so filtering rows by it is equivalent to filtering accounts.
+#
+# OTHER_STATUS_LABEL has no checkbox and is always kept - an
+# unanticipated status value shouldn't vanish from the totals just
+# because there's no control for it.
+if _status_column_present and not filtered.empty and set(included_status_labels) != set(SELECTABLE_STATUS_LABELS):
+    status_buckets = bucket_account_status(filtered["Account Status"])
+    keep = status_buckets.isin(included_status_labels | {OTHER_STATUS_LABEL})
+    before_count = filtered["Original player ID"].nunique()
+    filtered = filtered[keep]
+    removed_count = before_count - filtered["Original player ID"].nunique()
+    excluded_labels = [
+        label.strip() for label in SELECTABLE_STATUS_LABELS
+        if label not in included_status_labels
+    ]
+    st.sidebar.caption(
+        f"Excluded {removed_count:,} of {before_count:,} accounts "
+        f"({', '.join(excluded_labels).lower()})."
+    )
+
 if exclude_outlier_accounts and not filtered.empty:
     # Total GGR per row, same formula used everywhere else in this app
     # (Casino GGR + SB GGR, which already includes SB Correction).
@@ -1090,8 +2143,8 @@ if filtered.empty:
 
 # ── TABS ─────────────────────────────────────────────────────────────
 
-tab_cohort, tab_partner, tab_campaign, tab_commission = st.tabs([
-    "FTD Cohort View", "By Partner ID", "By Campaign ID", "By Commission ID",
+tab_cohort, tab_partner, tab_campaign, tab_commission, tab_export = st.tabs([
+    "FTD Cohort View", "By Partner", "By Campaign ID", "By Commission ID", "Model Export",
 ])
 
 with tab_cohort:
@@ -1133,29 +2186,204 @@ with tab_cohort:
     relative_month_charts = build_relative_month_series(chart_data, include_affiliate_costs)
 
     chart_pairs = list(relative_month_charts.items())
+
+    # ── 30 DAYS % OF PLAYERS STILL DEPOSITING ──
+    # Appended to the same grid as the monthly charts rather than given
+    # its own section, but fed by its own query (account-level FTD +
+    # last deposit timestamps) rather than by the ROI dash view - see
+    # load_deposit_lifecycle_data() and build_relative_day_retention().
+    # Everything below is guarded so that a failure, a missing table or
+    # a bad join key drops this one panel from the grid and leaves the
+    # other six untouched.
+    DAY_CHART_TITLE = f"{RELATIVE_DAY_WINDOW} Days % of Players Still Depositing"
+    day_chart_note = None
+
+    lifecycle = load_deposit_lifecycle_data()
+    if not lifecycle.empty:
+        # Restricting by player_id against `filtered` makes this chart
+        # respect every sidebar control - Partner/Campaign/Landing Page Type/Commission and
+        # the outlier exclusion - without reimplementing any of that
+        # filtering logic here.
+        #
+        # Both sides are cast to str first: "Original player ID" and
+        # customer_data's key can differ in dtype (int64 vs object)
+        # between the two queries, and .isin() across mismatched dtypes
+        # matches NOTHING silently rather than erroring - which would
+        # render an empty chart that looks like a data problem upstream.
+        filtered_ids = set(filtered["Original player ID"].dropna().astype(str))
+        lifecycle_scoped = lifecycle[lifecycle["player_id"].astype(str).isin(filtered_ids)]
+
+        if lifecycle_scoped.empty:
+            day_chart_note = (
+                "No accounts matched between the ROI dash and the deposit "
+                f"lifecycle query - check that customer_data.{CUSTOMER_DATA_JOIN_KEY} "
+                "is the same identifier as \"Original player ID\"."
+            )
+        else:
+            # Reported rather than silent: these accounts are excluded
+            # from every denominator, so if the number is large the
+            # curves are describing a self-selected subset. A high figure
+            # is also the first symptom of a wrong join key, since a bad
+            # key produces NULLs rather than an error.
+            n_matched = len(lifecycle_scoped)
+            n_no_last_deposit = int(lifecycle_scoped["last_deposit_at"].isna().sum())
+            if n_no_last_deposit:
+                day_chart_note = (
+                    f"Excluded {n_no_last_deposit:,} of {n_matched:,} accounts with no "
+                    "recorded last successful deposit."
+                )
+            chart_pairs.append((
+                DAY_CHART_TITLE,
+                build_relative_day_retention(lifecycle_scoped, cohort_months=months),
+            ))
+
     for i in range(0, len(chart_pairs), 2):
         cols = st.columns(2)
         for col, (chart_title, chart_df) in zip(cols, chart_pairs[i:i + 2]):
             with col:
                 st.caption(chart_title)
-                render_cumulative_chart(chart_df, is_percent=(chart_title == "% of Players Still Depositing"))
+                is_day_chart = chart_title == DAY_CHART_TITLE
+                render_cumulative_chart(
+                    chart_df,
+                    is_percent=is_day_chart or chart_title == "% of Players Still Depositing",
+                    x_field="Relative Day" if is_day_chart else "Relative Month",
+                )
+                if is_day_chart:
+                    st.caption(
+                        f"Each line stops once fewer than "
+                        f"{MIN_COHORT_COVERAGE_PER_POINT:.0%} of that cohort has been "
+                        "around long enough to reach that day. A cohort still inside "
+                        "its own 30-day window can only answer for later days using "
+                        "its earliest signups — day 25 of the current month is "
+                        "answerable only by accounts that joined on the 1st — so "
+                        "carrying the line further would compare a different, "
+                        "shrinking group at each point and could make it rise, which "
+                        "on a survival curve would look like lapsed players returning."
+                    )
+                if is_day_chart and day_chart_note:
+                    st.caption(day_chart_note)
 
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
 
 def render_ranking_tab(tab, group_col, label):
     with tab:
-        st.subheader(f"Ranked by Player LTV - {label}")
-        st.caption(
-            "Lifetime totals across every FTD cohort, ranked highest Player LTV first. "
-            "Affiliate Costs includes Fixed Monthly Charge, split equally across each "
-            "FTD Month's new signups and attributed to their own acquisition month."
+        st.subheader(f"Ranked by ARPU after {ARPU_MATURITY_MONTHS} months - {label}")
+        excluded_ftd_months = immature_ftd_months(df)
+        excluded_display = ", ".join(
+            sorted(excluded_ftd_months, key=month_sort_key, reverse=True)
         )
-        result, profit_label, ltv_label = build_ranking_table(filtered, group_col, include_affiliate_costs)
-        display = format_ranking_table(result, profit_label, ltv_label)
+        st.caption(
+            f"ARPU after {ARPU_MATURITY_MONTHS} months is Profit divided by FTD Count with the "
+            f"{ARPU_MATURITY_MONTHS} most recent FTD-month cohorts removed from BOTH "
+            f"({excluded_display}), so groups aren't penalised for cohorts too "
+            "young to have earned out yet. Every other column is a lifetime total "
+            "across ALL cohorts, so ARPU won't equal this table's own Profit ÷ FTD "
+            "Count. Affiliate Costs includes Fixed Monthly Charge, split equally "
+            "across each FTD Month's new signups and attributed to their own "
+            "acquisition month."
+        )
+        result, profit_label, arpu_label = build_ranking_table(
+            filtered, group_col, include_affiliate_costs, excluded_ftd_months
+        )
+        if group_col == "Partner ID" and partner_names:
+            # Renamed AFTER grouping and ranking, never before - grouping
+            # on names would silently merge two Partner IDs that happen
+            # to share a name into one row.
+            result = result.rename(
+                index=lambda pid: partner_display_name(pid, partner_names)
+            )
+            result.index.name = "Partner"
+        display = format_ranking_table(result, profit_label, arpu_label)
         st.dataframe(display, use_container_width=True, height=min(35 * len(display) + 80, 700))
 
 
-render_ranking_tab(tab_partner, "Partner ID", "Partner ID")
+with tab_export:
+    st.subheader("LTV model export")
+    st.caption(
+        "One row per account per relative month, for survival-weighted LTV "
+        "modelling. Account IDs are replaced with a stable hash - which is "
+        "pseudonymisation, not anonymisation: the mapping is rebuildable by "
+        "anyone holding the ID list, so treat the file as confidential."
+    )
+
+    export_min_months = st.number_input(
+        "Minimum whole months since FTD",
+        min_value=0, max_value=36, value=3, step=1,
+        help=(
+            "This is really a choice of LTV HORIZON: at 3, every included cohort "
+            "has at least 3 months of history, so LTV can be modelled out to "
+            "relative month 3. Set it no higher than the longest horizon you "
+            "actually need - a lower value is strictly more data, and a model "
+            "can always filter upward, whereas an export can't recover cohorts "
+            "it left out.\n\n"
+            "Note this excludes cohorts ACQUIRED in the last N months, not the "
+            "last N months of activity - an included cohort keeps its spend "
+            "right up to today."
+        ),
+    )
+
+    # Live feedback on the trade-off, so the threshold is chosen against
+    # the real cohort count rather than guessed at.
+    _as_of = pd.Timestamp.today()
+    _all_cohorts = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key)
+    _kept = [m for m in _all_cohorts if cohort_months_elapsed(m, _as_of) >= int(export_min_months)]
+    if _kept:
+        st.caption(
+            f"{len(_kept)} of {len(_all_cohorts)} cohorts qualify "
+            f"({_kept[0]}-{_kept[-1]}); {len(_all_cohorts) - len(_kept)} excluded as too recent."
+        )
+    else:
+        st.caption(f"No cohort is {int(export_min_months)}+ months old - nothing would be exported.")
+    export_max_accounts = st.number_input(
+        "Cap on number of accounts (0 = no cap)",
+        min_value=0, value=0, step=1000,
+        help=(
+            "Takes a reproducible random sample of ACCOUNTS, never of rows - "
+            "sampling rows would tear an account's history apart and make "
+            "survival meaningless. Useful for a quick look before exporting "
+            "everything."
+        ),
+    )
+    export_apply_filters = st.checkbox(
+        "Apply the current sidebar filters",
+        value=False,
+        help=(
+            "Off by default, deliberately. The outlier and account-status "
+            "toggles remove accounts in ways that would bias a retention model "
+            "without being visible in the exported file - the survivorship "
+            "problem in miniature. Leave off unless you specifically want a "
+            "filtered slice."
+        ),
+    )
+
+    if st.button("Build export"):
+        source = filtered if export_apply_filters else df
+        with st.spinner("Building export..."):
+            # Called again rather than reusing the cohort tab's variable:
+            # it's cached, so this is free, and it removes a dependency on
+            # which tab body happened to run first.
+            export_df, export_note = build_ltv_model_export(
+                source,
+                load_deposit_lifecycle_data(),
+                int(export_min_months),
+                int(export_max_accounts),
+            )
+        if export_df.empty:
+            st.warning(export_note)
+        else:
+            st.success(export_note)
+            st.dataframe(export_df.head(20), use_container_width=True)
+            st.download_button(
+                "Download CSV",
+                data=export_df.to_csv(index=False).encode("utf-8"),
+                file_name=(
+                    f"ltv_model_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+                ),
+                mime="text/csv",
+            )
+
+
+render_ranking_tab(tab_partner, "Partner ID", "Partner")
 render_ranking_tab(tab_campaign, "Campaign ID", "Campaign ID")
 render_ranking_tab(tab_commission, "Commission ID", "Commission ID")
