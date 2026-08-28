@@ -403,7 +403,7 @@ def load_deposit_lifecycle_data():
 
 
 @st.cache_data(ttl=600)
-def load_gaming_activity_lifecycle_data():
+def load_gaming_activity_lifecycle_data(exclude_free_play=True):
     """
     One row per account: FTD timestamp, and their LAST gaming activity
     date (Casino OR Sportsbook, whichever is later). Feeds the "% of
@@ -426,6 +426,28 @@ def load_gaming_activity_lifecycle_data():
     The two are combined by taking whichever gives the LATER date per
     account, in SQL, so this returns one row per account either way.
 
+    exclude_free_play=True (the gaming retention charts' default)
+    excludes free-bet/free-spin activity from both sources BEFORE the
+    MAX(date) aggregation, so an account whose only recent activity was
+    a free bet or free spin doesn't count as "still playing" on the
+    strength of that alone:
+      - Sportsbook: bets where "Is Free Bet" = 'Yes' (case-insensitive,
+        matching the same convention used elsewhere in this project -
+        e.g. merge_reports.py's free_sports_bets calculation) are
+        excluded. NULL/unset is treated as NOT a free bet (i.e. kept),
+        the same way LOWER(...) = 'yes' elsewhere only ever flags a
+        CONFIRMED free bet rather than assuming one.
+      - Casino: "Casino Data By Day" has no per-bet real/free split,
+        only daily aggregates - so a day only counts as real-money
+        activity when that day's "Betting Rounds" > "Free Spins" (both
+        COALESCEd to 0 first, since a day with genuine betting activity
+        but zero free spins may well have "Free Spins" stored as NULL
+        rather than 0 - treating NULL as 0 avoids incorrectly excluding
+        that day).
+    Every distinct cached call is keyed on this parameter, so toggling
+    the checkbox in the UI re-queries rather than reusing a stale
+    result computed under the other setting.
+
     Deliberately a separate query from load_deposit_lifecycle_data()
     rather than added columns on it, for the same reasons documented
     there - and so a failure in ONE source (e.g. a schema change to
@@ -435,6 +457,14 @@ def load_gaming_activity_lifecycle_data():
     try:
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        casino_free_filter = (
+            'WHERE COALESCE("Betting Rounds", 0) > COALESCE("Free Spins", 0)'
+            if exclude_free_play else ""
+        )
+        sports_free_filter = (
+            "AND COALESCE(LOWER(\"Is Free Bet\"), 'no') = 'no'"
+            if exclude_free_play else ""
+        )
         query = f'''
             WITH ftd AS (
                 SELECT
@@ -448,6 +478,7 @@ def load_gaming_activity_lifecycle_data():
             casino_last AS (
                 SELECT "Account ID" AS player_id, MAX("Date") AS last_date
                 FROM "Casino Data By Day"
+                {casino_free_filter}
                 GROUP BY 1
             ),
             sports_last AS (
@@ -455,6 +486,7 @@ def load_gaming_activity_lifecycle_data():
                 SELECT "Account ID" AS player_id, MAX("Placement Date"::date) AS last_date
                 FROM "All Bets Master Log"
                 WHERE "Placement Date" IS NOT NULL
+                {sports_free_filter}
                 GROUP BY 1
             ),
             combined_last AS (
@@ -490,7 +522,7 @@ def load_gaming_activity_lifecycle_data():
 
 
 @st.cache_data(ttl=600)
-def load_gaming_activity_daily_data():
+def load_gaming_activity_daily_data(exclude_free_play=True):
     """
     One row per (account, relative day) for every day 1-RELATIVE_DAY_WINDOW
     on which that account had ANY gaming activity (Casino OR Sportsbook -
@@ -499,6 +531,13 @@ def load_gaming_activity_daily_data():
     of Players Who Played" per-day bar chart - a non-cumulative
     snapshot, unlike the survival-curve lifecycle query above, so it
     needs the actual set of active days rather than just the LAST one.
+
+    exclude_free_play=True (the gaming retention charts' default)
+    applies the SAME free-bet/free-spin exclusion as
+    load_gaming_activity_lifecycle_data() - see that function's
+    docstring for the exact rule and the NULL-handling reasoning behind
+    it (both must stay in sync, since the two charts they feed are
+    meant to describe the same underlying definition of "played").
 
     Bounded to the 30-day window inside the SQL itself (both source
     joins filter on the same relative-day range the app plots), rather
@@ -516,6 +555,14 @@ def load_gaming_activity_daily_data():
     try:
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        casino_free_filter = (
+            'AND COALESCE(cd."Betting Rounds", 0) > COALESCE(cd."Free Spins", 0)'
+            if exclude_free_play else ""
+        )
+        sports_free_filter = (
+            "AND COALESCE(LOWER(ab.\"Is Free Bet\"), 'no') = 'no'"
+            if exclude_free_play else ""
+        )
         query = f'''
             WITH ftd AS (
                 SELECT
@@ -533,6 +580,7 @@ def load_gaming_activity_daily_data():
                 FROM "Casino Data By Day" cd
                 JOIN ftd f ON f.player_id = cd."Account ID"
                 WHERE (cd."Date" - f.ftd_date) + 1 BETWEEN 1 AND {RELATIVE_DAY_WINDOW}
+                {casino_free_filter}
             ),
             sports_relative AS (
                 SELECT DISTINCT
@@ -542,6 +590,7 @@ def load_gaming_activity_daily_data():
                 JOIN ftd f ON f.player_id = ab."Account ID"
                 WHERE ab."Placement Date" IS NOT NULL
                   AND (ab."Placement Date"::date - f.ftd_date) + 1 BETWEEN 1 AND {RELATIVE_DAY_WINDOW}
+                {sports_free_filter}
             )
             SELECT player_id, relative_day FROM casino_relative
             UNION
@@ -2744,6 +2793,20 @@ with tab_cohort:
         "that day."
     )
 
+    exclude_free_play = st.checkbox(
+        "Exclude Free Bets & Spins",
+        value=True,
+        key="gaming_retention_exclude_free",
+        help=(
+            "On by default. Sportsbook: excludes bets where \"Is Free "
+            "Bet\" = Yes. Casino: excludes days where that account's "
+            "Betting Rounds isn't greater than their Free Spins that day "
+            "(Casino Data By Day has no per-bet real/free split, only "
+            "daily totals, so this is a day-level proxy rather than an "
+            "exact filter)."
+        ),
+    )
+
     # Same month list the FTD Cohort View table above uses (already
     # reverse-chronological and narrowed by the min_ftd_count sidebar
     # control), so "07/26" here means the same cohort it means
@@ -2761,7 +2824,7 @@ with tab_cohort:
         ),
     )
 
-    gaming_lifecycle = load_gaming_activity_lifecycle_data()
+    gaming_lifecycle = load_gaming_activity_lifecycle_data(exclude_free_play)
     if gaming_lifecycle.empty:
         st.info("Gaming activity retention data is unavailable.")
     else:
@@ -2801,7 +2864,7 @@ with tab_cohort:
             # covers both the sidebar filters (via gaming_filtered_ids)
             # and, when set, the FTD Month dropdown above.
             gaming_scoped_ids = set(gaming_lifecycle_scoped["player_id"].astype(str))
-            gaming_daily = load_gaming_activity_daily_data()
+            gaming_daily = load_gaming_activity_daily_data(exclude_free_play)
             gaming_daily_scoped = (
                 gaming_daily[gaming_daily["player_id"].astype(str).isin(gaming_scoped_ids)]
                 if not gaming_daily.empty
