@@ -706,6 +706,45 @@ def bucket_account_status(series):
     return series.map(to_label)
 
 
+# ── LANDING PAGE TYPE BREAKDOWN (FTD Count detail rows) ──────────────
+
+# Unlike account status, this isn't a fixed enum of known buckets - the
+# "Landing Page Type" column comes from a manually-maintained Campaign
+# ID -> Landing Page Type lookup (see upload_campaign_landing_pages.py /
+# rebuild_affilka_roi_dash.sql), and its set of real values (currently
+# Casino/Sports) can grow without a code change here. Every label is
+# therefore derived from whatever distinct values are actually present
+# in the data at render time, prefixed with LANDING_PAGE_ROW_PREFIX so
+# format_cell() and the tooltip lookup below can recognise a landing
+# page detail row without needing to know its exact value in advance.
+LANDING_PAGE_ROW_PREFIX = "  Landing Page: "
+# Rows with no match in the Campaign Landing Pages lookup - most
+# commonly non-affiliate rows, or a real Campaign ID not yet added to
+# that lookup table (see Campaign Landing Pages' own coverage caveats).
+NO_LANDING_PAGE_TYPE_LABEL = f"{LANDING_PAGE_ROW_PREFIX}(none)"
+
+
+def bucket_landing_page_type(series):
+    """
+    Normalises a raw "Landing Page Type" column to display row labels -
+    "  Landing Page: <Type>" for each distinct value found (e.g. Casino,
+    Sports), or NO_LANDING_PAGE_TYPE_LABEL for NULL/blank. Same
+    NULL-and-blank-are-the-same-bucket handling as
+    bucket_account_status(), but no lowercasing of real values - Landing
+    Page Type is a controlled value from a lookup table maintained
+    outside this app, not free text, so its casing is trusted as-is.
+    """
+    def to_label(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return NO_LANDING_PAGE_TYPE_LABEL
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "null"}:
+            return NO_LANDING_PAGE_TYPE_LABEL
+        return f"{LANDING_PAGE_ROW_PREFIX}{text}"
+
+    return series.map(to_label)
+
+
 def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     """
     Groups the (already-filtered) dataframe by FTD Month and computes
@@ -825,16 +864,26 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     # ── Volume ──
     rows["FTD Count"] = ftd_count
 
-    # FTD Count detail rows, present only if the Account Status column
-    # was attached upstream (it isn't if the status query failed).
+    # FTD Count detail rows, present only if the relevant column was
+    # attached upstream (Account Status isn't if that query failed;
+    # Landing Page Type isn't if the underlying join found no match for
+    # any row in the currently-filtered data - see bucket_landing_page_type()).
     #
     # These sum the SAME "FTD Count" column the parent row does, just
-    # partitioned by status, rather than counting distinct accounts.
+    # partitioned by status/type, rather than counting distinct accounts.
     # That matters: "FTD Count" is 1 on EVERY one of an account's
     # FTD-month commission rows (see allocate_fixed_monthly_charge()),
     # so a distinct-account breakdown would not add up to the parent
     # row. Partitioning the parent's own rows makes the details
     # reconcile by construction, whatever the parent does.
+    #
+    # Both breakdowns are two DIFFERENT partitions of the same total
+    # (an account has exactly one status AND exactly one landing page
+    # type, so the two lists don't relate to or sum against each other)
+    # but are combined into ONE expandable "FTD Count" section rather
+    # than two separate ones, so the "Show detail rows for:" control
+    # doesn't end up with two identically-labelled "FTD Count" options.
+    status_detail_rows = []
     if "Account Status" in df.columns:
         status_buckets = bucket_account_status(df["Account Status"])
         status_counts = (
@@ -844,7 +893,6 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
             .unstack(fill_value=0)
             .reindex(columns=months, fill_value=0)
         )
-        status_detail_rows = []
         for label in ACCOUNT_STATUS_ROW_ORDER:
             series = status_counts.loc[label] if label in status_counts.index else None
             # "Other status" is clutter when nothing falls into it, but
@@ -860,9 +908,34 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
             rows[label] = series.reindex(months).fillna(0)
             status_detail_rows.append(label)
 
-        if status_detail_rows:
-            total_rows.add("FTD Count")
-            sections.append(("FTD Count", status_detail_rows))
+    landing_detail_rows = []
+    if "Landing Page Type" in df.columns:
+        landing_buckets = bucket_landing_page_type(df["Landing Page Type"])
+        landing_counts = (
+            df.assign(_landing_bucket=landing_buckets)
+            .groupby(["_landing_bucket", "FTD Month"])["FTD Count"]
+            .sum()
+            .unstack(fill_value=0)
+            .reindex(columns=months, fill_value=0)
+        )
+        # Real types sorted alphabetically, with the "(none)" residual
+        # bucket always last - same ordering convention as Other/No
+        # status above. Only labels actually present in this (already
+        # sidebar-filtered) data are shown, so a Landing Page Type
+        # filtered out entirely by the sidebar doesn't leave a
+        # permanently-zero row behind.
+        present_labels = sorted(
+            label for label in landing_counts.index if label != NO_LANDING_PAGE_TYPE_LABEL
+        )
+        if NO_LANDING_PAGE_TYPE_LABEL in landing_counts.index:
+            present_labels.append(NO_LANDING_PAGE_TYPE_LABEL)
+        for label in present_labels:
+            rows[label] = landing_counts.loc[label].reindex(months).fillna(0)
+            landing_detail_rows.append(label)
+
+    if status_detail_rows or landing_detail_rows:
+        total_rows.add("FTD Count")
+        sections.append(("FTD Count", status_detail_rows + landing_detail_rows))
 
     rows["Deposits"] = deposits
 
@@ -1720,7 +1793,7 @@ def render_cohort_table_html(table, total_rows, visible_rows):
     def format_cell(row_name, value):
         if row_name in PERCENT_ROWS:
             return format_pct(value)
-        elif row_name in COUNT_ROWS:
+        elif row_name in COUNT_ROWS or row_name.startswith(LANDING_PAGE_ROW_PREFIX):
             return "" if pd.isna(value) else f"{value:,.0f}"
         else:
             return format_currency(value)
@@ -1736,7 +1809,20 @@ def render_cohort_table_html(table, total_rows, visible_rows):
             continue
         is_total = row_name in total_rows
         row_class = "total-row" if is_total else "detail-row"
-        explanation = ROW_EXPLANATIONS.get(row_name, "")
+        if row_name.startswith(LANDING_PAGE_ROW_PREFIX):
+            # Labels are data-dependent (see bucket_landing_page_type()),
+            # so ROW_EXPLANATIONS can't carry a fixed entry per value -
+            # every landing-page row gets the same generic explanation
+            # instead.
+            explanation = (
+                "Source: Campaign Landing Pages (manual lookup)\n\n"
+                "The same FTD Count figure as the row above, split by each "
+                "account's Landing Page Type - Casino vs Sports, sourced from "
+                'the Campaign ID -> Landing Page Type lookup table. "(none)" '
+                "covers rows whose Campaign ID has no match in that lookup."
+            )
+        else:
+            explanation = ROW_EXPLANATIONS.get(row_name, "")
         title_attr = html_module.escape(explanation).replace("\n", "&#10;") if explanation else ""
         label_html = html_module.escape(row_name)
 
