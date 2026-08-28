@@ -2096,29 +2096,50 @@ selected_landing_page_types = st.sidebar.multiselect(
 selected_commissions = st.sidebar.multiselect("Commission ID", commission_ids)
 
 st.sidebar.divider()
-st.sidebar.caption("Marketing consent")
 
-# Tri-state (True / False / Any) rather than a checkbox, since these are
-# NULLABLE booleans - accounts with no match in the Contactable lookup
-# (e.g. non-affiliate rows before that table covered them, or a genuine
-# gap in the export) show as neither opted-in nor opted-out. "Any"
-# leaves the column unfiltered entirely, including those NULL rows;
-# selecting "True" or "False" only matches that literal value and
-# excludes NULLs either way - a NULL consent status only shows up under
-# "Any", never gets counted as an implicit False.
+# Tri-state (Any / Opted in / Opted out) rather than a checkbox, since
+# these are NULLABLE booleans - accounts with no match in the
+# Contactable lookup (e.g. non-affiliate rows before that table covered
+# them, or a genuine gap in the export) show as neither opted-in nor
+# opted-out. "Any" leaves the column unfiltered entirely, including
+# those NULL rows; "Opted in"/"Opted out" only match that literal value
+# and exclude NULLs either way - a NULL consent status only shows up
+# under "Any", never gets counted as an implicit opt-out.
+#
+# Rendered as horizontal radio buttons inside a collapsed expander
+# (auto-expanded once a filter is actually set) rather than four
+# always-visible dropdowns - all three choices are visible without a
+# click, and the sidebar stays uncluttered when these aren't in use.
+# The short per-filter labels drop the repeated "Marketing" prefix
+# since the expander title already says so.
+CONSENT_OPTIONS = ["Any", "Opted in", "Opted out"]
 MARKETING_CONSENT_COLUMNS = {
-    "Marketing Sms Betting": "marketing_sms_betting",
-    "Marketing Sms Casino": "marketing_sms_casino",
-    "Marketing Email Betting": "marketing_email_betting",
-    "Marketing Email Casino": "marketing_email_casino",
+    "Marketing Sms Betting": ("consent_sms_betting", "SMS – Betting"),
+    "Marketing Sms Casino": ("consent_sms_casino", "SMS – Casino"),
+    "Marketing Email Betting": ("consent_email_betting", "Email – Betting"),
+    "Marketing Email Casino": ("consent_email_casino", "Email – Casino"),
 }
+
+# Read prior widget state (if any) BEFORE creating the widgets below, so
+# the expander's own title can show how many filters are active even
+# while it's still collapsed.
+active_consent_count = sum(
+    1 for state_key, _ in MARKETING_CONSENT_COLUMNS.values()
+    if st.session_state.get(state_key, "Any") != "Any"
+)
+consent_expander_label = "Marketing consent"
+if active_consent_count:
+    consent_expander_label += f" ({active_consent_count} active)"
+
 selected_marketing_consent = {}
-for column_label, state_key in MARKETING_CONSENT_COLUMNS.items():
-    selected_marketing_consent[column_label] = st.sidebar.selectbox(
-        column_label,
-        ["Any", "True", "False"],
-        key=f"consent_{state_key}",
-    )
+with st.sidebar.expander(consent_expander_label, expanded=active_consent_count > 0):
+    for column_label, (state_key, short_label) in MARKETING_CONSENT_COLUMNS.items():
+        selected_marketing_consent[column_label] = st.radio(
+            short_label,
+            CONSENT_OPTIONS,
+            horizontal=True,
+            key=state_key,
+        )
 
 st.sidebar.divider()
 st.sidebar.caption("Include accounts with status")
@@ -2203,9 +2224,9 @@ if selected_landing_page_types:
 if selected_commissions:
     filtered = filtered[filtered["Commission ID"].isin(selected_commissions)]
 for column_label, choice in selected_marketing_consent.items():
-    if choice == "True":
+    if choice == "Opted in":
         filtered = filtered[filtered[column_label] == True]  # noqa: E712 - pandas boolean-column comparison, not identity
-    elif choice == "False":
+    elif choice == "Opted out":
         filtered = filtered[filtered[column_label] == False]  # noqa: E712
 
 # Applied BEFORE the outlier exclusion below, so the 5%/95% thresholds
