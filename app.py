@@ -283,6 +283,8 @@ def load_roi_dash_data():
             SELECT
                 "FTD Month", "Activity Month", "Original player ID", "Relative Month",
                 "Partner ID", "Campaign ID", "Landing Page Type", "Commission ID",
+                "Marketing Sms Betting", "Marketing Sms Casino",
+                "Marketing Email Betting", "Marketing Email Casino",
                 "FTD Count", "Deposits sum", "Deposits count",
                 "Casino GGR", "SB GGR", "SB Correction",
                 "Casino Bonus", "SB Bonus",
@@ -2094,6 +2096,31 @@ selected_landing_page_types = st.sidebar.multiselect(
 selected_commissions = st.sidebar.multiselect("Commission ID", commission_ids)
 
 st.sidebar.divider()
+st.sidebar.caption("Marketing consent")
+
+# Tri-state (True / False / Any) rather than a checkbox, since these are
+# NULLABLE booleans - accounts with no match in the Contactable lookup
+# (e.g. non-affiliate rows before that table covered them, or a genuine
+# gap in the export) show as neither opted-in nor opted-out. "Any"
+# leaves the column unfiltered entirely, including those NULL rows;
+# selecting "True" or "False" only matches that literal value and
+# excludes NULLs either way - a NULL consent status only shows up under
+# "Any", never gets counted as an implicit False.
+MARKETING_CONSENT_COLUMNS = {
+    "Marketing Sms Betting": "marketing_sms_betting",
+    "Marketing Sms Casino": "marketing_sms_casino",
+    "Marketing Email Betting": "marketing_email_betting",
+    "Marketing Email Casino": "marketing_email_casino",
+}
+selected_marketing_consent = {}
+for column_label, state_key in MARKETING_CONSENT_COLUMNS.items():
+    selected_marketing_consent[column_label] = st.sidebar.selectbox(
+        column_label,
+        ["Any", "True", "False"],
+        key=f"consent_{state_key}",
+    )
+
+st.sidebar.divider()
 st.sidebar.caption("Include accounts with status")
 
 # One checkbox per status bucket, all ticked by default, so the default
@@ -2175,6 +2202,11 @@ if selected_landing_page_types:
     filtered = filtered[filtered["Landing Page Type"].isin(selected_landing_page_types)]
 if selected_commissions:
     filtered = filtered[filtered["Commission ID"].isin(selected_commissions)]
+for column_label, choice in selected_marketing_consent.items():
+    if choice == "True":
+        filtered = filtered[filtered[column_label] == True]  # noqa: E712 - pandas boolean-column comparison, not identity
+    elif choice == "False":
+        filtered = filtered[filtered[column_label] == False]  # noqa: E712
 
 # Applied BEFORE the outlier exclusion below, so the 5%/95% thresholds
 # are percentiles of the population actually being analysed rather than
