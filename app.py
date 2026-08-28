@@ -403,6 +403,162 @@ def load_deposit_lifecycle_data():
 
 
 @st.cache_data(ttl=600)
+def load_gaming_activity_lifecycle_data():
+    """
+    One row per account: FTD timestamp, and their LAST gaming activity
+    date (Casino OR Sportsbook, whichever is later). Feeds the "% of
+    Players Still Playing" gaming retention chart - same shape and same
+    role as load_deposit_lifecycle_data(), just "last gaming activity"
+    instead of "last deposit", so it can be passed straight into
+    build_relative_day_retention() via that function's last_event_col
+    parameter.
+
+    "Gaming activity" combines two different sources, since there's no
+    single table covering both verticals:
+      - Casino: "Casino Data By Day", one row per (Date, Bet Type,
+        Account ID) - MAX("Date") per account gives their last Casino
+        activity day, regardless of which Bet Type.
+      - Sportsbook: "All Bets Master Log"."Placement Date" - the date a
+        bet was PLACED (not settled), since "did they play that day" is
+        about placing activity, not eventual settlement - a bet placed
+        on day 10 and settled on day 14 means the account was active on
+        day 10, not day 14.
+    The two are combined by taking whichever gives the LATER date per
+    account, in SQL, so this returns one row per account either way.
+
+    Deliberately a separate query from load_deposit_lifecycle_data()
+    rather than added columns on it, for the same reasons documented
+    there - and so a failure in ONE source (e.g. a schema change to
+    Casino Data By Day) can't take out the deposit retention chart too.
+    """
+    conn = get_healthy_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            WITH ftd AS (
+                SELECT
+                    "Original player ID" AS player_id,
+                    MIN("First deposit date") AS ftd_at
+                FROM "{SOURCE_VIEW}"
+                WHERE "First deposit date" IS NOT NULL
+                  AND "Original player ID" IS NOT NULL
+                GROUP BY 1
+            ),
+            casino_last AS (
+                SELECT "Account ID" AS player_id, MAX("Date") AS last_date
+                FROM "Casino Data By Day"
+                GROUP BY 1
+            ),
+            sports_last AS (
+                -- Placement Date, not Settlement Date - see docstring.
+                SELECT "Account ID" AS player_id, MAX("Placement Date"::date) AS last_date
+                FROM "All Bets Master Log"
+                WHERE "Placement Date" IS NOT NULL
+                GROUP BY 1
+            ),
+            combined_last AS (
+                -- Whichever of Casino/Sportsbook is later per account -
+                -- UNION ALL then re-aggregated, rather than a FULL OUTER
+                -- JOIN + GREATEST(), since an account active in only one
+                -- vertical would otherwise need NULL-safe handling on
+                -- both sides of that JOIN anyway.
+                SELECT player_id, MAX(last_date) AS last_gaming_activity_at
+                FROM (
+                    SELECT * FROM casino_last
+                    UNION ALL
+                    SELECT * FROM sports_last
+                ) both_verticals
+                GROUP BY player_id
+            )
+            SELECT
+                f.player_id,
+                f.ftd_at,
+                cl.last_gaming_activity_at
+            FROM ftd f
+            LEFT JOIN combined_last cl
+                   ON cl.player_id = f.player_id
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.warning(
+            f"Couldn't load gaming activity lifecycle data ({e}) - the "
+            "gaming retention charts are unavailable. The rest of the "
+            "dashboard is unaffected."
+        )
+        return pd.DataFrame(columns=["player_id", "ftd_at", "last_gaming_activity_at"])
+
+
+@st.cache_data(ttl=600)
+def load_gaming_activity_daily_data():
+    """
+    One row per (account, relative day) for every day 1-RELATIVE_DAY_WINDOW
+    on which that account had ANY gaming activity (Casino OR Sportsbook -
+    see load_gaming_activity_lifecycle_data() for why these two sources
+    and why Placement Date rather than Settlement Date). Feeds the "%
+    of Players Who Played" per-day bar chart - a non-cumulative
+    snapshot, unlike the survival-curve lifecycle query above, so it
+    needs the actual set of active days rather than just the LAST one.
+
+    Bounded to the 30-day window inside the SQL itself (both source
+    joins filter on the same relative-day range the app plots), rather
+    than pulling every activity date ever and filtering in pandas -
+    both "Casino Data By Day" and "All Bets Master Log" can be very
+    large tables, and this keeps the result to at worst (accounts x 30)
+    rows regardless of how much history either table holds.
+
+    UNION (not UNION ALL) between the two per-vertical CTEs collapses
+    an account that played BOTH Casino and Sportsbook on the same
+    relative day into one row - this chart counts "played that day" at
+    all, not which vertical.
+    """
+    conn = get_healthy_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            WITH ftd AS (
+                SELECT
+                    "Original player ID" AS player_id,
+                    MIN("First deposit date")::date AS ftd_date
+                FROM "{SOURCE_VIEW}"
+                WHERE "First deposit date" IS NOT NULL
+                  AND "Original player ID" IS NOT NULL
+                GROUP BY 1
+            ),
+            casino_relative AS (
+                SELECT DISTINCT
+                    cd."Account ID" AS player_id,
+                    (cd."Date" - f.ftd_date) + 1 AS relative_day
+                FROM "Casino Data By Day" cd
+                JOIN ftd f ON f.player_id = cd."Account ID"
+                WHERE (cd."Date" - f.ftd_date) + 1 BETWEEN 1 AND {RELATIVE_DAY_WINDOW}
+            ),
+            sports_relative AS (
+                SELECT DISTINCT
+                    ab."Account ID" AS player_id,
+                    (ab."Placement Date"::date - f.ftd_date) + 1 AS relative_day
+                FROM "All Bets Master Log" ab
+                JOIN ftd f ON f.player_id = ab."Account ID"
+                WHERE ab."Placement Date" IS NOT NULL
+                  AND (ab."Placement Date"::date - f.ftd_date) + 1 BETWEEN 1 AND {RELATIVE_DAY_WINDOW}
+            )
+            SELECT player_id, relative_day FROM casino_relative
+            UNION
+            SELECT player_id, relative_day FROM sports_relative
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.warning(
+            f"Couldn't load daily gaming activity data ({e}) - the '% of "
+            "Players Who Played' chart is unavailable. The rest of the "
+            "dashboard is unaffected."
+        )
+        return pd.DataFrame(columns=["player_id", "relative_day"])
+
+
+
+@st.cache_data(ttl=600)
 def load_account_status_data():
     """
     One row per account: its current account_status from customer_data,
@@ -1216,45 +1372,65 @@ def build_relative_day_retention(
     min_observed=MIN_OBSERVED_ACCOUNTS_PER_POINT,
     min_coverage=MIN_COHORT_COVERAGE_PER_POINT,
     as_of=None,
+    last_event_col="last_deposit_at",
+    single_series=False,
 ):
     """
-    Builds "% of Players Still Depositing" by RELATIVE DAY (1-window),
-    one line per FTD Month cohort - the same cohort grouping and the
-    same MM/YY labels as every other chart in this app, so colours and
-    legend order stay consistent.
+    Builds "% of Players Still X" by RELATIVE DAY (1-window), one line
+    per FTD Month cohort - the same cohort grouping and the same MM/YY
+    labels as every other chart in this app, so colours and legend
+    order stay consistent.
+
+    last_event_col names the column in `lifecycle_df` that holds each
+    account's LAST occurrence of whatever event this curve tracks -
+    "last_deposit_at" for the deposit retention chart this was
+    originally written for, or "last_gaming_activity_at" for the
+    gaming-activity version (see load_gaming_activity_lifecycle_data()).
+    The guarding logic below (min_observed, min_coverage, the
+    NaN-not-zero handling) is entirely event-agnostic, so this is
+    parameterised rather than duplicated into a near-identical function
+    per event type - a fix to that logic applies to every curve built
+    from it, not just whichever one prompted it.
+
+    single_series=True treats the WHOLE (already sidebar-filtered)
+    population passed in as ONE group instead of splitting by FTD
+    Month cohort, and returns a plain pandas Series (index "Relative
+    Day", values 0-100) rather than a wide per-cohort DataFrame - for a
+    single aggregate bar chart rather than one line per cohort.
+    cohort_months is ignored in this mode (there's only one group).
 
     Day 1 is the account's OWN FTD day. An account counts as "still
-    depositing" at day N if its last successful deposit falls on or
+    X" at day N if its last occurrence of that event falls on or
     after its own day N.
 
-    THIS IS A SURVIVAL CURVE, NOT A PER-DAY SNAPSHOT. customer_data's
-    last_successful_deposit is ONE timestamp per account, not a deposit
-    event log, so "did this account deposit ON day N" is not answerable
-    from it. What IS answerable is "was this account's deposit lifetime
-    still running at day N". Concretely, versus the monthly
-    "% of Players Still Depositing" chart above:
+    THIS IS A SURVIVAL CURVE, NOT A PER-DAY SNAPSHOT. The lifecycle
+    data is ONE timestamp per account, not a full event log, so "did
+    this account X ON day N" is not answerable from it. What IS
+    answerable is "was this account's X-ing lifetime still running at
+    day N". Concretely, versus a per-day snapshot chart:
 
-      - Monthly chart: an account with no deposit in relative month 3
-        but one in month 4 is absent from month 3 and present in month
-        4. That line can go back up.
-      - This chart: an account whose last deposit is day 25 counts as
-        "still depositing" on every day 1-25, including days it made no
-        deposit at all. This line can only go down.
+      - Per-day snapshot: an account with no event in relative day 3
+        but one on day 4 is absent from day 3 and present on day 4.
+        That line/bars can go back up.
+      - This chart: an account whose last event is day 25 counts as
+        "still X" on every day 1-25, including days it had no event at
+        all. This line can only go down.
 
     For a 30-day window that's the more readable chart regardless - a
-    literal "% depositing ON day N" would fall to near-zero by day 3,
-    since very few accounts deposit daily.
+    literal "% X-ing ON day N" would fall to near-zero within days for
+    most event types, since very few accounts do anything daily.
 
-    THE DENOMINATOR IS PER-DAY, NOT PER-COHORT. At day N, only accounts
-    that have actually had N days elapsed since their own FTD are
-    counted. This matters more than it sounds: a monthly cohort spans up
-    to 31 FTD dates, so mid-month a single cohort contains accounts with
-    wildly different observation windows. Using the whole cohort as a
-    fixed denominator would make every young cohort's curve slope
-    downward purely because its late-in-the-month signups haven't had
-    time to deposit again yet - a censoring artefact that looks
-    identical to real churn. This is the day-level equivalent of the
-    NaN-not-zero handling in build_relative_month_series().
+    THE DENOMINATOR IS PER-DAY, NOT PER-COHORT (or, in single_series
+    mode, per the whole population). At day N, only accounts that have
+    actually had N days elapsed since their own FTD are counted. This
+    matters more than it sounds: a monthly cohort spans up to 31 FTD
+    dates, so mid-month a single cohort contains accounts with wildly
+    different observation windows. Using the whole cohort as a fixed
+    denominator would make every young cohort's curve slope downward
+    purely because its late-in-the-month signups haven't had time to
+    X again yet - a censoring artefact that looks identical to real
+    churn. This is the day-level equivalent of the NaN-not-zero
+    handling in build_relative_month_series().
 
     That per-day denominator has a cost, which min_coverage exists to
     contain: as N grows, the eligible set for a cohort still inside its
@@ -1265,31 +1441,42 @@ def build_relative_day_retention(
     unless at least min_coverage of the cohort is still observable, so
     every plotted point describes substantially the whole cohort.
     min_observed drops points for the separate reason of being too few
-    accounts to be stable at all.
+    accounts to be stable at all. In single_series mode, min_coverage
+    still applies against the whole population as its own "cohort" -
+    with many FTD months combined this rarely binds in practice, since
+    the eligible pool at any given day is large and drawn from many
+    different acquisition months rather than one shrinking slice.
 
-    Accounts with no recorded last_successful_deposit are DROPPED, not
+    Accounts with no recorded last_event_col value are DROPPED, not
     counted. Two consequences to keep in mind: every cohort's
-    denominator here is "accounts with a recorded last deposit" rather
-    than its FTD Count, so cohort sizes won't tie back to the table
-    above; and if those NULLs represent a customer_data coverage gap
+    denominator here is "accounts with a recorded event" rather than
+    its FTD Count, so cohort sizes won't tie back to the table above;
+    and if those NULLs represent a genuine coverage gap in the source
     rather than genuinely inactive accounts, retention is overstated by
     exactly the accounts most likely to have lapsed. The call site
     reports how many were dropped so that's visible rather than assumed.
 
-    An account whose last deposit is dated BEFORE its own FTD is a data
+    An account whose last event is dated BEFORE its own FTD is a data
     inconsistency rather than a missing value, so it's clamped to the
     FTD date (i.e. counted as day-1-only) rather than dropped.
 
     as_of defaults to today, and is a parameter mainly so this is
     testable against a fixed date.
 
-    Returns a wide DataFrame - index "Relative Day", one column per FTD
-    Month, values 0-100. NaN is left in deliberately (no .fillna(0)) for
-    (cohort, day) combinations that either haven't happened yet or fall
-    below min_observed, so Altair breaks the line rather than drawing a
-    0% point that reads as total churn.
+    Returns a wide DataFrame (single_series=False) - index "Relative
+    Day", one column per FTD Month, values 0-100 - or a Series
+    (single_series=True) with the same index. NaN is left in
+    deliberately (no .fillna(0)) for (cohort, day) combinations that
+    either haven't happened yet or fall below min_observed/min_coverage,
+    so Altair breaks the line/omits the bar rather than drawing a
+    misleading 0% point.
     """
-    empty = pd.DataFrame(index=pd.RangeIndex(1, window + 1, name="Relative Day"))
+    empty_df = pd.DataFrame(index=pd.RangeIndex(1, window + 1, name="Relative Day"))
+    empty_series = pd.Series(
+        index=pd.RangeIndex(1, window + 1, name="Relative Day"), dtype=float
+    )
+    empty = empty_series if single_series else empty_df
+
     if lifecycle_df.empty:
         return empty
 
@@ -1299,36 +1486,40 @@ def build_relative_day_retention(
 
     # Both reduced to tz-naive local calendar dates before anything is
     # compared or subtracted - see to_local_naive_date(). The two
-    # columns come from different sources and disagree on tz-awareness,
-    # which pandas treats as an error rather than silently picking an
-    # interpretation.
+    # columns can come from different sources and disagree on
+    # tz-awareness, which pandas treats as an error rather than
+    # silently picking an interpretation.
     d["ftd_date"] = to_local_naive_date(d["ftd_at"])
-    d["last_date"] = to_local_naive_date(d["last_deposit_at"])
+    d["last_date"] = to_local_naive_date(d[last_event_col])
     d = d.dropna(subset=["ftd_date"])
 
-    # No recorded last deposit -> removed entirely, so these accounts
-    # appear in no denominator at all. See docstring for what that does
-    # to the interpretation of the curve.
+    # No recorded event -> removed entirely, so these accounts appear
+    # in no denominator at all. See docstring for what that does to the
+    # interpretation of the curve.
     d = d.dropna(subset=["last_date"])
     if d.empty:
         return empty
 
-    # Last deposit predating the account's own FTD is an inconsistency,
+    # Last event predating the account's own FTD is an inconsistency,
     # not a missing value - clamped rather than dropped.
     d.loc[d["last_date"] < d["ftd_date"], "last_date"] = d["ftd_date"]
 
-    # Same MM/YY cohort label the rest of the app uses, derived here from
-    # the FTD timestamp. If the ROI dash view derives its own "FTD Month"
-    # any other way (e.g. from an Affilka-supplied month field with a
-    # different timezone or cutoff), a handful of accounts near a month
-    # boundary could land in a different cohort here than they do in the
-    # table above.
-    d["FTD Month"] = d["ftd_date"].dt.strftime("%m/%y")
-
-    if cohort_months is not None:
-        d = d[d["FTD Month"].isin(cohort_months)]
-    if d.empty:
-        return empty
+    if single_series:
+        # Whole population treated as one group - a constant label so
+        # the same groupby loop below works unchanged either way.
+        d["_group"] = "__all__"
+    else:
+        # Same MM/YY cohort label the rest of the app uses, derived
+        # here from the FTD timestamp. If the ROI dash view derives its
+        # own "FTD Month" any other way (e.g. from an Affilka-supplied
+        # month field with a different timezone or cutoff), a handful
+        # of accounts near a month boundary could land in a different
+        # cohort here than they do in the table above.
+        d["_group"] = d["ftd_date"].dt.strftime("%m/%y")
+        if cohort_months is not None:
+            d = d[d["_group"].isin(cohort_months)]
+        if d.empty:
+            return empty
 
     as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
 
@@ -1336,7 +1527,7 @@ def build_relative_day_retention(
     d["days_observed"] = (as_of_ts - d["ftd_date"]).dt.days + 1
 
     records = []
-    for month, cohort in d.groupby("FTD Month"):
+    for group, cohort in d.groupby("_group"):
         observed = cohort["days_observed"].to_numpy()
         last_day = cohort["last_relative_day"].to_numpy()
         cohort_size = len(cohort)
@@ -1346,20 +1537,146 @@ def build_relative_day_retention(
             coverage = n_eligible / cohort_size if cohort_size else 0.0
             # Two independent reasons to drop a point: too few accounts
             # left to be stable (min_observed), or too small a SHARE of
-            # the cohort left for the point to still describe that
-            # cohort rather than an early-signing slice of it
-            # (min_coverage). The second is what stops a partial
-            # cohort's line rising - see MIN_COHORT_COVERAGE_PER_POINT.
+            # the group left for the point to still describe that group
+            # rather than an early-signing slice of it (min_coverage).
+            # The second is what stops a partial cohort's line rising -
+            # see MIN_COHORT_COVERAGE_PER_POINT.
             if n_eligible < min_observed or coverage < min_coverage:
                 pct = float("nan")
             else:
                 still = int((last_day[eligible] >= day).sum())
                 pct = 100.0 * still / n_eligible
-            records.append({"FTD Month": month, "Relative Day": day, "pct": pct})
+            records.append({"_group": group, "Relative Day": day, "pct": pct})
 
     long = pd.DataFrame(records)
-    wide = long.pivot(index="Relative Day", columns="FTD Month", values="pct").astype(float)
+
+    if single_series:
+        series = long.set_index("Relative Day")["pct"].astype(float)
+        return series.reindex(range(1, window + 1)).sort_index()
+
+    wide = long.pivot(index="Relative Day", columns="_group", values="pct").astype(float)
     return wide.reindex(range(1, window + 1)).sort_index()
+
+
+def build_played_on_day_series(
+    activity_df,
+    lifecycle_df,
+    window=RELATIVE_DAY_WINDOW,
+    min_observed=MIN_OBSERVED_ACCOUNTS_PER_POINT,
+    as_of=None,
+):
+    """
+    Builds "% of Players Who Played" by RELATIVE DAY (1-window) - the
+    per-day NON-cumulative counterpart to build_relative_day_retention()'s
+    survival curve, aggregated across the whole population passed in
+    (no per-cohort split - this always returns one Series, for a single
+    bar chart).
+
+    "Played" means the account had ANY gaming activity that specific
+    relative day - Casino (Casino Data By Day) or Sportsbook (All Bets
+    Master Log's Placement Date), see load_gaming_activity_daily_data().
+    Unlike the survival curve above, this can genuinely go up and down
+    day to day (day 7 might show more players than day 6, e.g. a
+    weekend effect) since it's asking "did they play THAT day", not
+    "have they played since".
+
+    activity_df: one row per (account, relative day) they played -
+    load_gaming_activity_daily_data(), already scoped to the current
+    sidebar filters by the caller.
+    lifecycle_df: one row per account with an FTD date (used for the
+    denominator only, via days_observed - the SAME "has this account
+    even reached day N yet" guard build_relative_day_retention() uses,
+    for the same reason: without it, young accounts that haven't
+    reached day N yet would count as "eligible but didn't play" and
+    drag the later days down artificially rather than being excluded
+    as not-yet-observable). Must cover EVERY account in scope, not just
+    ones that played - an account that never played still belongs in
+    the denominator with 0 numerator contribution.
+
+    Returns a Series - index "Relative Day", values 0-100. NaN (not 0)
+    for a day where fewer than min_observed accounts are eligible yet,
+    so the bar is simply absent rather than misleadingly drawn at 0%.
+    """
+    empty = pd.Series(index=pd.RangeIndex(1, window + 1, name="Relative Day"), dtype=float)
+    if lifecycle_df.empty:
+        return empty
+
+    d = lifecycle_df.dropna(subset=["ftd_at"]).copy()
+    if d.empty:
+        return empty
+
+    d["ftd_date"] = to_local_naive_date(d["ftd_at"])
+    d = d.dropna(subset=["ftd_date"])
+    if d.empty:
+        return empty
+
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+    d["days_observed"] = (as_of_ts - d["ftd_date"]).dt.days + 1
+    observed = d["days_observed"].to_numpy()
+
+    if activity_df is None or activity_df.empty:
+        played_by_day = pd.Series(dtype="int64")
+    else:
+        # Defensive de-dupe on top of the SQL's own UNION/DISTINCT - a
+        # second guard against ever double-counting one account playing
+        # both verticals on the same day, in case this is ever called
+        # with unscoped or differently-sourced data.
+        played_by_day = (
+            activity_df.drop_duplicates(subset=["player_id", "relative_day"])
+            .groupby("relative_day")["player_id"]
+            .nunique()
+        )
+
+    values = {}
+    for day in range(1, window + 1):
+        n_eligible = int((observed >= day).sum())
+        if n_eligible < min_observed:
+            values[day] = float("nan")
+        else:
+            played = int(played_by_day.get(day, 0))
+            values[day] = 100.0 * played / n_eligible
+
+    series = pd.Series(values, dtype=float)
+    series.index.name = "Relative Day"
+    return series.reindex(range(1, window + 1)).sort_index()
+
+
+def render_relative_day_bar_chart(series, y_title):
+    """
+    Renders a Series (index "Relative Day" 1-window, values 0-100 or
+    NaN) as a bar chart - the aggregate-across-cohorts counterpart to
+    render_cumulative_chart()'s per-cohort line charts, for the two
+    gaming activity charts which are single aggregate series rather
+    than one line per FTD Month.
+
+    NaN values (days below min_observed - see build_played_on_day_series()
+    / build_relative_day_retention()) are dropped before plotting rather
+    than rendered as a 0%-height bar, which would misleadingly read as
+    "confirmed zero" instead of "not enough data yet".
+    """
+    chart_df = series.reset_index()
+    chart_df.columns = ["Relative Day", "value"]
+    chart_df = chart_df.dropna(subset=["value"])
+
+    if chart_df.empty:
+        st.info("Not enough data to show this chart yet.")
+        return
+
+    chart = (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            x=alt.X(
+                "Relative Day:O",
+                title="Relative Day",
+                sort=list(range(1, RELATIVE_DAY_WINDOW + 1)),
+            ),
+            y=alt.Y("value:Q", title=y_title, scale=alt.Scale(domain=[0, 100])),
+            tooltip=["Relative Day", alt.Tooltip("value:Q", format=".1f", title=y_title)],
+        )
+        .properties(height=300)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 # Columns summed as-is when flattening the view to one row per
@@ -2401,6 +2718,99 @@ with tab_cohort:
                     )
                 if is_day_chart and day_chart_note:
                     st.caption(day_chart_note)
+
+    # ── GAMING ACTIVITY RETENTION (DAY 1-30) ──
+    # Two bar charts, aggregated across every account currently in view
+    # rather than broken out per FTD cohort (unlike every chart above) -
+    # a bar chart with 30 bars per cohort line would be unreadable with
+    # more than a couple of cohorts on screen at once, so this
+    # deliberately collapses the whole filtered population into one
+    # series per chart instead. "Played" combines two different
+    # sources, since no single table covers both verticals - see
+    # load_gaming_activity_daily_data() / load_gaming_activity_lifecycle_data():
+    #   - Casino: any row for that account in "Casino Data By Day" on
+    #     that calendar date.
+    #   - Sportsbook: a bet with that "Placement Date" in "All Bets
+    #     Master Log" - placement, not settlement, since the question
+    #     is when they were actually active, not when a bet resolved.
+    # Both queries are independently guarded the same way as the
+    # deposit-lifecycle query above - a failure in either drops just
+    # these two panels, not the rest of the dashboard.
+    st.divider()
+    st.subheader("Gaming Activity Retention (Day 1-30)")
+    st.caption(
+        "Aggregated across every account currently in view, not broken "
+        "out by FTD cohort like the charts above. \"Played\" means any "
+        "Casino activity (Casino Data By Day) or Sportsbook bet placed "
+        "(All Bets Master Log's Placement Date) that day."
+    )
+
+    gaming_lifecycle = load_gaming_activity_lifecycle_data()
+    if gaming_lifecycle.empty:
+        st.info("Gaming activity retention data is unavailable.")
+    else:
+        # Same str-cast-both-sides pattern as the deposit retention
+        # chart above, and the same reasoning: "Original player ID" and
+        # the gaming tables' "Account ID" can differ in dtype between
+        # queries, and .isin() across mismatched dtypes matches nothing
+        # silently rather than erroring.
+        gaming_filtered_ids = set(filtered["Original player ID"].dropna().astype(str))
+        gaming_lifecycle_scoped = gaming_lifecycle[
+            gaming_lifecycle["player_id"].astype(str).isin(gaming_filtered_ids)
+        ]
+
+        if gaming_lifecycle_scoped.empty:
+            st.info(
+                "No accounts matched between the ROI dash and the gaming "
+                "activity lifecycle query - check that \"Casino Data By "
+                "Day\".\"Account ID\" and \"All Bets Master Log\".\"Account "
+                "ID\" are the same identifier as \"Original player ID\"."
+            )
+        else:
+            gaming_daily = load_gaming_activity_daily_data()
+            gaming_daily_scoped = (
+                gaming_daily[gaming_daily["player_id"].astype(str).isin(gaming_filtered_ids)]
+                if not gaming_daily.empty
+                else gaming_daily
+            )
+
+            n_matched = len(gaming_lifecycle_scoped)
+            n_no_activity = int(gaming_lifecycle_scoped["last_gaming_activity_at"].isna().sum())
+            if n_no_activity:
+                st.caption(
+                    f"Excluded {n_no_activity:,} of {n_matched:,} accounts with no "
+                    "recorded Casino or Sportsbook activity at all."
+                )
+
+            played_series = build_played_on_day_series(gaming_daily_scoped, gaming_lifecycle_scoped)
+            still_playing_series = build_relative_day_retention(
+                gaming_lifecycle_scoped,
+                last_event_col="last_gaming_activity_at",
+                single_series=True,
+            )
+
+            gaming_col1, gaming_col2 = st.columns(2)
+            with gaming_col1:
+                st.caption("% of Players Who Played")
+                render_relative_day_bar_chart(played_series, "% played that day")
+                st.caption(
+                    "Non-cumulative - the % who had ANY Casino or Sportsbook "
+                    "activity on that SPECIFIC day, not since. Can rise and "
+                    "fall day to day."
+                )
+            with gaming_col2:
+                st.caption("% of Players Still Playing")
+                render_relative_day_bar_chart(still_playing_series, "% still playing")
+                st.caption(
+                    "A survival curve, not a daily snapshot - an account "
+                    "whose last gaming activity was day 15 counts as \"still "
+                    "playing\" on every day 1-15, so this can only go down. "
+                    f"Bars are omitted once fewer than "
+                    f"{MIN_COHORT_COVERAGE_PER_POINT:.0%} of the eligible "
+                    "population has been around long enough to reach that "
+                    "day, for the same reason described above for the "
+                    "deposit retention chart."
+                )
 
     st.caption(f"Data loaded: {datetime.now().strftime('%Y-%m-%d %H:%M')} (cached for 10 minutes)")
 
