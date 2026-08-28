@@ -2739,10 +2739,26 @@ with tab_cohort:
     st.divider()
     st.subheader("Gaming Activity Retention (Day 1-30)")
     st.caption(
-        "Aggregated across every account currently in view, not broken "
-        "out by FTD cohort like the charts above. \"Played\" means any "
-        "Casino activity (Casino Data By Day) or Sportsbook bet placed "
-        "(All Bets Master Log's Placement Date) that day."
+        "\"Played\" means any Casino activity (Casino Data By Day) or "
+        "Sportsbook bet placed (All Bets Master Log's Placement Date) "
+        "that day."
+    )
+
+    # Same month list the FTD Cohort View table above uses (already
+    # reverse-chronological and narrowed by the min_ftd_count sidebar
+    # control), so "07/26" here means the same cohort it means
+    # everywhere else on this page - not a second, independently
+    # derived list of months that could quietly disagree with it.
+    selected_gaming_month = st.selectbox(
+        "FTD Month",
+        ["All Months"] + months,
+        key="gaming_retention_month",
+        help=(
+            "Aggregated across every FTD Month cohort by default (a bar "
+            "chart with 30 bars per cohort would be unreadable with more "
+            "than a couple of cohorts at once) - pick one month here to "
+            "see that cohort's own retention instead."
+        ),
     )
 
     gaming_lifecycle = load_gaming_activity_lifecycle_data()
@@ -2759,6 +2775,20 @@ with tab_cohort:
             gaming_lifecycle["player_id"].astype(str).isin(gaming_filtered_ids)
         ]
 
+        if selected_gaming_month != "All Months":
+            # Same MM/YY convention derived from ftd_at that
+            # build_relative_day_retention() uses internally - computed
+            # here too so the dropdown can narrow the population BEFORE
+            # that function ever sees it, since single_series mode
+            # collapses whatever it's given into one series and has no
+            # month-filtering of its own.
+            gaming_ftd_months = to_local_naive_date(
+                gaming_lifecycle_scoped["ftd_at"]
+            ).dt.strftime("%m/%y")
+            gaming_lifecycle_scoped = gaming_lifecycle_scoped[
+                gaming_ftd_months == selected_gaming_month
+            ]
+
         if gaming_lifecycle_scoped.empty:
             st.info(
                 "No accounts matched between the ROI dash and the gaming "
@@ -2767,9 +2797,13 @@ with tab_cohort:
                 "ID\" are the same identifier as \"Original player ID\"."
             )
         else:
+            # Narrowed to the SAME accounts as gaming_lifecycle_scoped -
+            # covers both the sidebar filters (via gaming_filtered_ids)
+            # and, when set, the FTD Month dropdown above.
+            gaming_scoped_ids = set(gaming_lifecycle_scoped["player_id"].astype(str))
             gaming_daily = load_gaming_activity_daily_data()
             gaming_daily_scoped = (
-                gaming_daily[gaming_daily["player_id"].astype(str).isin(gaming_filtered_ids)]
+                gaming_daily[gaming_daily["player_id"].astype(str).isin(gaming_scoped_ids)]
                 if not gaming_daily.empty
                 else gaming_daily
             )
