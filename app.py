@@ -1174,20 +1174,46 @@ def upfront_acquisition_costs(df):
     return (c("Actual_Fixed_Fee") + c("Allocated Fixed Monthly Charge")) * 1.2
 
 
-def windowed_profit(df, weights, include_affiliate_costs_in_ltv, include_fixed_costs):
+def fully_loaded_profit_terms(df, include_fixed_costs):
     """
-    Per-row profit over a day window: everything that accrues scaled by
-    the row's weight, minus any up-front acquisition cost in FULL.
-
-    The up-front split only applies when affiliate costs are being
-    charged at all - with the toggle off there is no acquisition cost in
-    the figure to charge early.
+    (accruing profit, up-front cost) per row with EVERY cost charged,
+    CPA included - the basis Estimated Payback Period measures against.
     """
-    profit = row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs)
-    if not include_affiliate_costs_in_ltv:
-        return profit * weights
+    return row_level_profit(df, True, include_fixed_costs), upfront_acquisition_costs(df)
 
-    upfront = upfront_acquisition_costs(df)
+
+def before_cpa_profit_terms(df, include_fixed_costs):
+    """
+    (accruing profit, up-front cost) per row with every cost charged
+    EXCEPT the CPA fee and its VAT - the basis the 1-Month and 3-Month
+    LTV rows measure, because those rows exist to SET the CPA.
+
+    Derived by taking the fully-loaded figure and adding the CPA fee
+    back, rather than by assembling the cost list a second time, so the
+    two bases can only ever differ by exactly that one component.
+
+    Rev Share and the Fixed Monthly Charge ARE charged. They're paid on
+    top of whatever CPA gets agreed, so leaving them out would overstate
+    what there is to spend. Only the Fixed Monthly Charge is up-front;
+    Rev Share follows revenue and so accrues with the window.
+    """
+    def c(col):
+        return df[col] if col in df.columns else 0.0
+
+    cpa_with_vat = c("Actual_Fixed_Fee") * 1.2
+    profit = row_level_profit(df, True, include_fixed_costs) + cpa_with_vat
+    return profit, c("Allocated Fixed Monthly Charge") * 1.2
+
+
+def windowed_profit(profit, upfront, weights):
+    """
+    Profit over a day window: everything that accrues scaled by the
+    row's weight, minus any up-front cost in FULL.
+
+    Takes the two terms rather than deriving them, so the caller decides
+    which costs are in play - see fully_loaded_profit_terms() and
+    before_cpa_profit_terms().
+    """
     return (profit + upfront) * weights - upfront
 
 
@@ -1214,13 +1240,35 @@ def cohort_observable_days(months, as_of=None):
     return observable
 
 
-def build_windowed_ltv(
-    df, months, window_days, include_affiliate_costs_in_ltv, include_fixed_costs, as_of=None
-):
+def build_windowed_ltv(df, months, window_days, include_fixed_costs, as_of=None):
     """
-    Each cohort's Player LTV over the first `window_days` days of each
-    account's life, windowed from that account's own "First deposit
-    date". Returns (series indexed by `months`, (n_dropped, n_accounts)).
+    What each cohort earned per acquired player over the first
+    `window_days` days of each account's life, windowed from that
+    account's own "First deposit date", with every cost charged EXCEPT
+    the CPA fee. Returns (series indexed by `months`,
+    (n_dropped, n_accounts)).
+
+    THIS IS A CPA CEILING, which is what it's for: read it as the most
+    that could be paid to acquire the average player in that cohort and
+    still be square by the end of the window. Charging the CPA fee here
+    would be circular - the figure exists to decide what that fee should
+    be - so it's the one cost held out. Everything else IS charged,
+    Rev Share and the Fixed Monthly Charge included, since those are
+    paid on top of whatever CPA gets agreed.
+
+    Two things to hold onto when quoting a number off this row:
+      - VAT. The row is what's available to spend INCLUDING the VAT on
+        it, so an affordable headline CPA is this figure ÷ 1.2.
+      - It's a mean over the cohort, and player value is heavily skewed.
+        Paying the average means breaking even only if the traffic keeps
+        the same mix; a partner sending thinner players than the blend
+        will not pay back at that price.
+
+    IGNORES the "Include Affiliate Costs" sidebar toggle, deliberately -
+    that toggle is all-or-nothing over the affiliate bundle, and ticking
+    it would drag the CPA fee back in. The "Include Fixed Costs" toggle
+    DOES apply, so Admin/Platform Fees is charged or not with everything
+    else.
 
     Parameterised on the window rather than written once per horizon, so
     the 30-day and 90-day rows are the same calculation at two lengths
@@ -1229,23 +1277,21 @@ def build_windowed_ltv(
 
     THE VIEW HAS NO DAILY GRAIN, so this is a day-WEIGHTED blend of
     monthly rows rather than a true daily cut - see
-    row_weights_for_window() for the weighting rule and why the FTD
-    month is the exception to it.
+    row_weights_for_window() for the weighting rule.
 
-    The one assumption is that a later month's revenue is spread evenly
-    across its days. It is not - a young cohort front-loads - and the
-    window always covers those months' EARLIEST days, so this reads
-    slightly LOW. The direction of the bias is at least stable across
-    cohorts, so month-on-month comparison holds up better than the
-    absolute figure does. It also matters LESS the longer the window:
-    at 90 days only the final partial month is apportioned, against
+    The one assumption is that revenue within a month spreads evenly
+    across the days the account was live in it. It does not - a young
+    cohort front-loads - and the window always covers the earliest of
+    those days, so this reads slightly LOW, i.e. slightly conservative
+    as a price ceiling. It also matters LESS the longer the window: at
+    90 days only the final partial month is apportioned, against
     roughly one of two months at 30 days.
 
     MATURITY: a cohort is shown only once its LAST possible account (an
     FTD on the final day of that month) has had a full window of
     completed data behind it - see cohort_observable_days(). Immature
     cohorts get NaN, which renders blank, rather than a partial figure
-    that would read as a genuinely low LTV.
+    that would read as a genuinely low ceiling.
 
     Accounts with no "First deposit date" are dropped from BOTH the
     numerator and the denominator - their window can't be placed at all,
@@ -1266,9 +1312,10 @@ def build_windowed_ltv(
     scoped = df[df["Original player ID"].astype(str).isin(per_account.index)]
     weights = row_weights_for_window(window_weight_terms(scoped, per_account), window_days)
 
-    weighted_profit = windowed_profit(
-        scoped, weights, include_affiliate_costs_in_ltv, include_fixed_costs
-    ).groupby(scoped["FTD Month"]).sum()
+    profit, upfront = before_cpa_profit_terms(scoped, include_fixed_costs)
+    weighted_profit = (
+        windowed_profit(profit, upfront, weights).groupby(scoped["FTD Month"]).sum()
+    )
     ftd_count = scoped.groupby("FTD Month")["FTD Count"].sum()
 
     ltv = pd.to_numeric(
@@ -1346,13 +1393,13 @@ def build_payback_period(df, months, include_fixed_costs, as_of=None):
     if grid[-1] != horizon:
         grid.append(horizon)
 
-    # Affiliate costs are always charged here, with the acquisition part
-    # of them charged in full from day one - see the docstring and
-    # windowed_profit().
+    # Affiliate costs are always charged here, CPA included, with the
+    # acquisition part charged in full from day one - see the docstring
+    # and windowed_profit(). Note this differs from the LTV rows above,
+    # which hold the CPA fee out because they exist to set it.
+    profit, upfront = fully_loaded_profit_terms(scoped, include_fixed_costs)
     cumulative = {
-        window: windowed_profit(
-            scoped, row_weights_for_window(terms, window), True, include_fixed_costs
-        )
+        window: windowed_profit(profit, upfront, row_weights_for_window(terms, window))
         .groupby(cohort_labels)
         .sum()
         .reindex(months)
@@ -1668,20 +1715,21 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     # Shorter horizons hang off Player LTV as collapsed detail rows, so
     # the bottom line stays a single number by default. They are NOT
     # components that sum to the parent - unlike every other section
-    # here, these are the SAME metric measured over shorter windows, so
-    # the parent is the largest of the three rather than their total.
+    # here, these are a different measurement over shorter windows, so
+    # the parent is not their total.
     #
-    # Labels are left unqualified: they inherit the basis stated on the
-    # parent row directly above them, and repeating "(excl. Affiliate
-    # Costs, excl. Fixed Costs)" on all three would be unreadable.
+    # They also sit on a DIFFERENT cost basis from the parent, which is
+    # why their labels carry it rather than inheriting the parent's:
+    # every cost except the CPA fee, whatever the Affiliate Costs toggle
+    # says, so they can be read as a CPA ceiling. See build_windowed_ltv().
     windowed_ltv_rows = []
     dropped_accounts = (0, 0)
     for label, window_days in (
-        ("  1-Month LTV", ONE_MONTH_LTV_DAYS),
-        ("  3-Month LTV", THREE_MONTH_LTV_DAYS),
+        ("  1-Month LTV (before CPA)", ONE_MONTH_LTV_DAYS),
+        ("  3-Month LTV (before CPA)", THREE_MONTH_LTV_DAYS),
     ):
         series, dropped_accounts = build_windowed_ltv(
-            df, months, window_days, include_affiliate_costs_in_ltv, include_fixed_costs
+            df, months, window_days, include_fixed_costs
         )
         rows[label] = series
         windowed_ltv_rows.append(label)
@@ -3001,11 +3049,22 @@ ROW_EXPLANATIONS = {
     ),
     "Profit": "Total GGR − Total Bonus − Sum of Deductions.",
     "Player LTV": "Profit ÷ FTD Count.",
-    "  1-Month LTV": (
-        "Profit over each account's first 30 days ÷ FTD Count - same basis and same "
-        "denominator as Player LTV above, just a fixed 30-day horizon instead of "
-        "lifetime-to-date. NOT a component of Player LTV: it's the same metric over a "
-        "shorter window, so the parent row is the larger figure, not the total.\n\n"
+    "  1-Month LTV (before CPA)": (
+        "What the average acquired player earned in their first 30 days, with every "
+        "cost charged EXCEPT the CPA fee - so read it as a CPA CEILING: the most that "
+        "could be paid for that cohort's average player and still be square by day "
+        "30.\n\n"
+        "VAT: this is what's available to spend INCLUDING the VAT on it, so an "
+        "affordable headline CPA is this figure ÷ 1.2. £90 here means about £75 of "
+        "CPA, not £90.\n\n"
+        "It's a MEAN, and player value is heavily skewed - a handful of players carry "
+        "the cohort. Paying the average only breaks even if the traffic keeps the same "
+        "mix; a partner sending thinner players than the blend won't pay back at that "
+        "price.\n\n"
+        "Rev Share and Fixed Monthly Charge ARE charged, since they're paid on top of "
+        "whatever CPA is agreed. This row therefore ignores the 'Include Affiliate "
+        "Costs' toggle - that's all-or-nothing over the whole bundle and would drag "
+        "the CPA fee back in. 'Include Fixed Costs' does still apply.\n\n"
         "The window starts at that account's own First deposit date. The view has no "
         "daily grain, so this is day-WEIGHTED rather than a true daily cut: each month "
         "counts at (days of the window falling in it) ÷ (days the account was live in "
@@ -3043,12 +3102,14 @@ ROW_EXPLANATIONS = {
         "within the completed data for that cohort, covering both a cohort too young "
         "to tell and one that genuinely hasn't earned out."
     ),
-    "  3-Month LTV": (
-        "Profit over each account's first 90 days ÷ FTD Count - identical calculation "
-        "to 1-Month LTV, just a longer window. See that row for the method and its "
-        "caveats.\n\n"
+    "  3-Month LTV (before CPA)": (
+        "The same CPA ceiling over 90 days instead of 30 - identical calculation, see "
+        "the row above for the method, the ÷ 1.2 VAT adjustment and the "
+        "skew warning.\n\n"
         "The even-spread assumption bites LESS here: at 90 days only the final partial "
-        "month is apportioned, against roughly one of two months at 30 days.\n\n"
+        "month is apportioned, against roughly one of two months at 30 days. The "
+        "trade-off is patience - a CPA set against this figure takes three months to "
+        "come back rather than one.\n\n"
         "Blank until the cohort's last-acquired account has had a full 90 days of "
         "completed data, so this fills in about two months later than the 1-Month row."
     ),
@@ -3376,16 +3437,19 @@ with tab_cohort:
 
     # Only shown while the Player LTV section is open - otherwise it's a
     # caption about rows that aren't on screen.
-    if any(row in {"  1-Month LTV", "  3-Month LTV", PAYBACK_ROW_LABEL} for row in visible_rows):
+    if any(row in {"  1-Month LTV (before CPA)", "  3-Month LTV (before CPA)", PAYBACK_ROW_LABEL}
+           for row in visible_rows):
         st.caption(
-            f"1-Month and 3-Month LTV cover each account's first {ONE_MONTH_LTV_DAYS} "
-            f"and {THREE_MONTH_LTV_DAYS} days from its own first deposit date, on the "
-            "same basis as Player LTV above. The view is monthly, so each is the whole "
-            "FTD month plus day-weighted slices of the months after it - blank where "
-            "the window hasn't fully elapsed. Estimated Payback Period is the same "
-            "curve read the other way: the day that profit covers affiliate costs, so "
-            "it always charges affiliate costs whatever the sidebar toggle says. Hover "
-            "a row label for the detail."
+            f"1-Month and 3-Month LTV (before CPA) are CPA ceilings: what the average "
+            f"acquired player earned in their first {ONE_MONTH_LTV_DAYS} and "
+            f"{THREE_MONTH_LTV_DAYS} days with every cost charged except the CPA fee "
+            "itself. An affordable headline CPA is the figure ÷ 1.2, since the row "
+            "includes the VAT you'd pay on it - and it's a mean over a skewed "
+            "distribution, so it only holds if a partner's traffic matches the blend. "
+            "Both ignore the Affiliate Costs toggle, which is all-or-nothing and would "
+            "pull the CPA fee back in. Estimated Payback Period is the other side of "
+            "the same question - the day the CPA actually paid is covered - so it "
+            "always charges the full affiliate bundle. Hover a row label for the detail."
         )
         if windowed_ltv_note:
             st.caption(windowed_ltv_note)
