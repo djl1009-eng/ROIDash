@@ -1006,6 +1006,17 @@ def deduction_basis_labels(include_affiliate_costs_in_ltv, include_fixed_costs):
 ONE_MONTH_LTV_DAYS = 30
 THREE_MONTH_LTV_DAYS = 90
 
+# Estimated Payback Period searches for the window length at which a
+# cohort's fully-loaded profit turns positive - see
+# build_payback_period(). PAYBACK_MAX_DAYS caps how far out it looks
+# (two years; a cohort that hasn't paid back by then is reported as
+# not paid back), and PAYBACK_GRID_STEP sets how coarse the search is
+# before interpolating. Every step is a full pass over the filtered
+# frame, so halving it roughly doubles the time this row costs.
+PAYBACK_ROW_LABEL = "  Estimated Payback Period (Days)"
+PAYBACK_MAX_DAYS = 730
+PAYBACK_GRID_STEP = 15
+
 
 def row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs):
     """
@@ -1044,6 +1055,113 @@ def row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs):
     return total_ggr - total_bonus - deductions
 
 
+def account_ftd_dates(df):
+    """
+    One first deposit date per account, plus (n_dropped, n_accounts) for
+    the accounts that have none at all.
+
+    Earliest wins, matching the MIN() the lifecycle queries use: the view
+    repeats "First deposit date" across every (activity month,
+    commission) row of an account and those can disagree.
+    """
+    account_key = df["Original player ID"].astype(str)
+    per_account = (
+        pd.DataFrame({
+            "account": account_key,
+            "ftd_date": to_local_naive_date(df["First deposit date"]),
+        })
+        .dropna(subset=["ftd_date"])
+        .groupby("account")["ftd_date"]
+        .min()
+    )
+    n_accounts = int(account_key.nunique())
+    return per_account, (n_accounts - len(per_account), n_accounts)
+
+
+def window_weight_terms(df, per_account):
+    """
+    Per-row terms that reduce a day-window weight to pure arithmetic in
+    the window length - see row_weights_for_window().
+
+    For a row in its account's relative month k:
+      days_before    - days from that account's FTD through the END of
+                       the month before this row's month (0 when k = 1)
+      days_in_month  - calendar days in this row's own month
+
+    Both come straight from the account's FTD date and the row's
+    Relative Month, since relative month k is calendar month
+    (FTD month + k - 1). Expressing it this way rather than as a loop
+    over relative months matters for build_payback_period(), which
+    evaluates these same weights at dozens of window lengths.
+    """
+    account_key = df["Original player ID"].astype(str)
+    ftd_date = pd.to_datetime(account_key.map(per_account), errors="coerce")
+    relative_month = pd.to_numeric(df["Relative Month"], errors="coerce").round()
+
+    # Rows with no usable FTD date, or from before the account's own FTD
+    # (Relative Month can be 0 or negative - see the view's "Pre or Post
+    # FTD" column), are outside any window by definition.
+    valid = ftd_date.notna() & relative_month.notna() & (relative_month >= 1)
+
+    ftd_period = ftd_date.dt.to_period("M")
+    offsets = relative_month.fillna(1).astype(int)
+
+    # For k = 1 this addresses the month BEFORE the FTD month, which is
+    # never read - days_before is forced to 0 there.
+    previous_month_end = (ftd_period + (offsets - 2)).dt.end_time.dt.normalize()
+    days_before = ((previous_month_end - ftd_date).dt.days + 1).where(relative_month >= 2, 0.0)
+    days_in_month = (ftd_period + (offsets - 1)).dt.end_time.dt.day
+
+    return {
+        "relative_month": relative_month,
+        "days_before": days_before,
+        "days_in_month": days_in_month,
+        "valid": valid,
+    }
+
+
+def row_weights_for_window(terms, window_days):
+    """
+    The 0-1 share of each row that falls inside a window of
+    `window_days` days from its account's own first deposit.
+
+    An account's OWN FTD month always weighs 1: it is entirely inside
+    the window by construction, since the account did not exist before
+    its FTD, so pro-rating it by days would discount revenue that all
+    happened inside those days. Every later month weighs
+    (days of window falling in it) / (days in it), because there the
+    account WAS live for the whole month.
+    """
+    weights = (
+        (window_days - terms["days_before"]) / terms["days_in_month"]
+    ).clip(lower=0.0, upper=1.0)
+    weights = weights.where(terms["relative_month"] >= 2, 1.0)
+    return weights.where(terms["valid"], 0.0).fillna(0.0)
+
+
+def cohort_observable_days(months, as_of=None):
+    """
+    Days of COMPLETED data behind each cohort's last possible account -
+    one with an FTD on the final day of that month.
+
+    Data is treated as complete only through the end of the last fully
+    elapsed calendar month, since the current month is always partial.
+    Returns a dict of {month: days}, negative where nothing has elapsed.
+    """
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+    data_complete_to = (as_of_ts.to_period("M") - 1).end_time.normalize()
+
+    observable = {}
+    for month in months:
+        year, month_number = month_sort_key(month)
+        if (year, month_number) == (0, 0):
+            observable[month] = -1
+            continue
+        cohort_end = pd.Period(freq="M", year=year, month=month_number).end_time.normalize()
+        observable[month] = (data_complete_to - cohort_end).days + 1
+    return observable
+
+
 def build_windowed_ltv(
     df, months, window_days, include_affiliate_costs_in_ltv, include_fixed_costs, as_of=None
 ):
@@ -1058,16 +1176,9 @@ def build_windowed_ltv(
     another copy of this logic.
 
     THE VIEW HAS NO DAILY GRAIN, so this is a day-WEIGHTED blend of
-    monthly rows rather than a true daily cut. Per account:
-
-      - Relative Month 1 (their own FTD calendar month) counts at FULL
-        weight. It is entirely inside the window by construction - the
-        account did not exist before its FTD - so pro-rating it by days
-        would discount revenue that all happened inside those days.
-      - Each LATER month counts at (days of the window falling in that
-        month) / (days in that month). Here the account WAS live for the
-        whole month, so a day share is the right apportionment.
-      - Months past the end of the window count zero.
+    monthly rows rather than a true daily cut - see
+    row_weights_for_window() for the weighting rule and why the FTD
+    month is the exception to it.
 
     The one assumption is that a later month's revenue is spread evenly
     across its days. It is not - a young cohort front-loads - and the
@@ -1075,21 +1186,14 @@ def build_windowed_ltv(
     slightly LOW. The direction of the bias is at least stable across
     cohorts, so month-on-month comparison holds up better than the
     absolute figure does. It also matters LESS the longer the window:
-    at 90 days only the final partial month is affected, against two of
-    roughly two months at 30 days.
-
-    Enough relative months are weighted to cover the window whatever the
-    calendar does - a 31st-of-the-month FTD followed by a short month
-    spills further than the arithmetic suggests - and the loop stops as
-    soon as no account has window left.
+    at 90 days only the final partial month is apportioned, against
+    roughly one of two months at 30 days.
 
     MATURITY: a cohort is shown only once its LAST possible account (an
     FTD on the final day of that month) has had a full window of
-    completed data behind it. Data is treated as complete through the
-    end of the last fully elapsed calendar month, since the current
-    month is always partial. Immature cohorts get NaN, which renders
-    blank, rather than a partial figure that would read as a genuinely
-    low LTV.
+    completed data behind it - see cohort_observable_days(). Immature
+    cohorts get NaN, which renders blank, rather than a partial figure
+    that would read as a genuinely low LTV.
 
     Accounts with no "First deposit date" are dropped from BOTH the
     numerator and the denominator - their window can't be placed at all,
@@ -1103,83 +1207,131 @@ def build_windowed_ltv(
     if df.empty or not required.issubset(df.columns):
         return empty, (0, 0)
 
-    account_key = df["Original player ID"].astype(str)
-    ftd_dates = to_local_naive_date(df["First deposit date"])
-
-    # One FTD date per account - earliest, matching the MIN() the
-    # lifecycle queries use, since the view repeats the column across
-    # every (activity month, commission) row of an account and they can
-    # disagree.
-    per_account = (
-        pd.DataFrame({"account": account_key, "ftd_date": ftd_dates})
-        .dropna(subset=["ftd_date"])
-        .groupby("account")["ftd_date"]
-        .min()
-    )
-
-    n_accounts = int(account_key.nunique())
-    dropped = (n_accounts - len(per_account), n_accounts)
-
+    per_account, dropped = account_ftd_dates(df)
     if per_account.empty:
         return empty, dropped
 
-    # Day-weights per account, one entry per relative month.
-    ftd_period = per_account.dt.to_period("M")
-    days_left_in_ftd_month = (
-        ftd_period.dt.end_time.dt.normalize() - per_account
-    ).dt.days + 1
-
-    weights = {1: pd.Series(1.0, index=per_account.index)}
-    remaining = (window_days - days_left_in_ftd_month).clip(lower=0)
-    # Upper bound only - the break below is what actually ends this.
-    # 28 is the shortest possible month, so this can never stop short.
-    max_relative_month = window_days // 28 + 3
-    for relative_month in range(2, max_relative_month + 1):
-        if not (remaining > 0).any():
-            break
-        days_in_month = (ftd_period + (relative_month - 1)).dt.end_time.dt.day
-        weights[relative_month] = remaining.clip(upper=days_in_month) / days_in_month
-        remaining = (remaining - days_in_month).clip(lower=0)
-
-    relative_month_col = pd.to_numeric(df["Relative Month"], errors="coerce").round()
-    row_weights = pd.Series(0.0, index=df.index)
-    for relative_month, account_weights in weights.items():
-        mask = relative_month_col == relative_month
-        if mask.any():
-            row_weights.loc[mask] = (
-                account_key[mask].map(account_weights).fillna(0.0).to_numpy()
-            )
-
-    # Accounts with no usable FTD date leave the denominator as well as
-    # the numerator - see docstring.
-    has_ftd_date = account_key.isin(per_account.index)
-    scoped = df[has_ftd_date]
+    scoped = df[df["Original player ID"].astype(str).isin(per_account.index)]
+    weights = row_weights_for_window(window_weight_terms(scoped, per_account), window_days)
 
     weighted_profit = (
-        (row_level_profit(scoped, include_affiliate_costs_in_ltv, include_fixed_costs)
-         * row_weights[has_ftd_date])
-        .groupby(scoped["FTD Month"])
-        .sum()
-    )
+        row_level_profit(scoped, include_affiliate_costs_in_ltv, include_fixed_costs) * weights
+    ).groupby(scoped["FTD Month"]).sum()
     ftd_count = scoped.groupby("FTD Month")["FTD Count"].sum()
 
-    ltv = (weighted_profit / ftd_count.replace(0, pd.NA)).reindex(months)
-    ltv = pd.to_numeric(ltv, errors="coerce")
+    ltv = pd.to_numeric(
+        (weighted_profit / ftd_count.replace(0, pd.NA)).reindex(months), errors="coerce"
+    )
 
-    # Blank out cohorts whose window hasn't finished - see docstring.
-    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
-    data_complete_to = (as_of_ts.to_period("M") - 1).end_time.normalize()
+    observable = cohort_observable_days(months, as_of)
     for month in months:
-        year, month_number = month_sort_key(month)
-        if (year, month_number) == (0, 0):
-            ltv.loc[month] = float("nan")
-            continue
-        cohort_end = pd.Period(freq="M", year=year, month=month_number).end_time.normalize()
-        if cohort_end + pd.Timedelta(days=window_days - 1) > data_complete_to:
+        if observable[month] < window_days:
             ltv.loc[month] = float("nan")
 
     ltv.index.name = "FTD Month"
     return ltv, dropped
+
+
+def build_payback_period(df, months, include_fixed_costs, as_of=None):
+    """
+    Days from first deposit until a cohort's profit has covered what was
+    paid to acquire it - i.e. the point where cumulative Profit equals
+    cumulative Total Affiliate Costs. Returns a series indexed by
+    `months`.
+
+    Equivalently, the window length at which the FULLY-LOADED LTV
+    crosses zero, which is how it's actually found: the same day-weighted
+    profit build_windowed_ltv() uses, evaluated at a series of window
+    lengths until it turns positive. That makes this row and the two LTV
+    rows above it the same curve read two ways - a cohort whose 3-Month
+    LTV is still negative cannot have a payback under 90 days.
+
+    IGNORES THE AFFILIATE COSTS TOGGLE, deliberately: a payback period
+    measured against a profit figure that never subtracted the
+    acquisition cost would have nothing to pay back, so affiliate costs
+    are always subtracted here. The Fixed Costs toggle still applies -
+    whether Admin/Platform Fees counts as a cost is a real question, and
+    including it genuinely lengthens payback.
+
+    Found on a coarse grid and then linearly interpolated within the
+    bracketing interval, rather than evaluated at every single day: each
+    evaluation is a pass over the whole filtered frame, and the curve is
+    piecewise linear in the window length anyway, so a day-by-day search
+    would cost ~15x more for a difference well inside the error of the
+    even-spread assumption underneath it.
+
+    THE FIRST crossing is what's reported. A cohort can cross, dip back
+    under on a bad month and cross again; the first is the honest answer
+    to "when did it pay back", but it does mean a marginal cohort's
+    figure can move around.
+
+    Blank means no crossing within the data available for that cohort -
+    which is "hasn't paid back yet, as far as can be seen", covering
+    both a young cohort and one that genuinely hasn't earned out.
+    """
+    empty = pd.Series(index=pd.Index(months, name="FTD Month"), dtype=float)
+    required = {"First deposit date", "Original player ID", "Relative Month", "FTD Month"}
+    if df.empty or not required.issubset(df.columns):
+        return empty
+
+    per_account, _ = account_ftd_dates(df)
+    if per_account.empty:
+        return empty
+
+    scoped = df[df["Original player ID"].astype(str).isin(per_account.index)]
+    if scoped.empty:
+        return empty
+
+    terms = window_weight_terms(scoped, per_account)
+    # Affiliate costs always subtracted - see docstring.
+    profit = row_level_profit(scoped, True, include_fixed_costs)
+    cohort_labels = scoped["FTD Month"]
+
+    observable = cohort_observable_days(months, as_of)
+    horizon = min(PAYBACK_MAX_DAYS, max(observable.values(), default=0))
+    if horizon < 1:
+        return empty
+
+    grid = [1] + list(range(PAYBACK_GRID_STEP, horizon + 1, PAYBACK_GRID_STEP))
+    if grid[-1] != horizon:
+        grid.append(horizon)
+
+    cumulative = {
+        window: (profit * row_weights_for_window(terms, window))
+        .groupby(cohort_labels)
+        .sum()
+        .reindex(months)
+        for window in grid
+    }
+
+    payback = {}
+    for month in months:
+        limit = observable[month]
+        previous_window, previous_value = None, None
+        result = float("nan")
+        for window in grid:
+            if window > limit:
+                break
+            value = cumulative[window].get(month, float("nan"))
+            if pd.isna(value):
+                break
+            if value >= 0:
+                if previous_window is None:
+                    # Already positive at day 1 - possible only if the
+                    # cohort had no acquisition cost at all.
+                    result = float(window)
+                else:
+                    span = window - previous_window
+                    fraction = (0 - previous_value) / (value - previous_value)
+                    result = float(previous_window + fraction * span)
+                break
+            previous_window, previous_value = window, value
+        payback[month] = max(1.0, round(result)) if pd.notna(result) else float("nan")
+
+    series = pd.Series(payback, dtype=float).reindex(months)
+    series.index.name = "FTD Month"
+    return series
+
 
 
 def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0):
@@ -1478,6 +1630,13 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
         )
         rows[label] = series
         windowed_ltv_rows.append(label)
+
+    # Same section, but a duration rather than a currency - it answers
+    # "when does the acquisition cost come back" where the two rows
+    # above answer "how much is back by day N". Deliberately blind to
+    # the Affiliate Costs toggle; see build_payback_period().
+    rows[PAYBACK_ROW_LABEL] = build_payback_period(df, months, include_fixed_costs)
+    windowed_ltv_rows.append(PAYBACK_ROW_LABEL)
     sections.append((ltv_label, windowed_ltv_rows))
 
     # Both windows drop the same accounts (the ones with no first
@@ -2619,7 +2778,7 @@ def render_cohort_table_html(table, total_rows, visible_rows):
 
 
 PERCENT_ROWS = {"  Bonus % of GGR"}
-COUNT_ROWS = {"FTD Count"} | set(ACCOUNT_STATUS_ROW_ORDER)
+COUNT_ROWS = {"FTD Count", PAYBACK_ROW_LABEL} | set(ACCOUNT_STATUS_ROW_ORDER)
 # Every row not in PERCENT_ROWS or COUNT_ROWS is a currency row -
 # formatting is now driven by exclusion rather than an explicit set,
 # since row labels change dynamically (Profit/LTV's label depends on
@@ -2804,6 +2963,24 @@ ROW_EXPLANATIONS = {
         "Blank means the cohort's last-acquired account hasn't had a full 30 days of "
         "completed data yet. Accounts with no first deposit date are excluded from "
         "both the numerator and the FTD Count denominator."
+    ),
+    "  Estimated Payback Period (Days)": (
+        "Days from first deposit until the cohort's Profit has covered its Total "
+        "Affiliate Costs - i.e. where cumulative Profit = cumulative Affiliate Costs. "
+        "Same thing as the day the fully-loaded LTV crosses zero, which is how it's "
+        "found: the 1-Month/3-Month calculation evaluated at a range of window lengths "
+        "until it turns positive, then interpolated.\n\n"
+        "IGNORES the 'Include Affiliate Costs' toggle - affiliate costs are always "
+        "subtracted here, since a payback period against a figure that never charged "
+        "the acquisition cost has nothing to pay back. The 'Include Fixed Costs' "
+        "toggle DOES apply, and turning it on lengthens payback.\n\n"
+        "Inherits the day-weighting caveat from the LTV rows above: revenue within a "
+        "later month is assumed to spread evenly across its days, which reads slightly "
+        "low, so a marginal cohort's payback reads slightly long.\n\n"
+        "The FIRST crossing is reported - a cohort that crosses, dips back under on a "
+        "bad month and crosses again shows the first date. Blank means no crossing "
+        "within the completed data for that cohort, covering both a cohort too young "
+        "to tell and one that genuinely hasn't earned out."
     ),
     "  3-Month LTV": (
         "Profit over each account's first 90 days ÷ FTD Count - identical calculation "
@@ -3138,13 +3315,16 @@ with tab_cohort:
 
     # Only shown while the Player LTV section is open - otherwise it's a
     # caption about rows that aren't on screen.
-    if any(row.strip() in {"1-Month LTV", "3-Month LTV"} for row in visible_rows):
+    if any(row in {"  1-Month LTV", "  3-Month LTV", PAYBACK_ROW_LABEL} for row in visible_rows):
         st.caption(
             f"1-Month and 3-Month LTV cover each account's first {ONE_MONTH_LTV_DAYS} "
             f"and {THREE_MONTH_LTV_DAYS} days from its own first deposit date, on the "
             "same basis as Player LTV above. The view is monthly, so each is the whole "
             "FTD month plus day-weighted slices of the months after it - blank where "
-            "the window hasn't fully elapsed. Hover a row label for the detail."
+            "the window hasn't fully elapsed. Estimated Payback Period is the same "
+            "curve read the other way: the day that profit covers affiliate costs, so "
+            "it always charges affiliate costs whatever the sidebar toggle says. Hover "
+            "a row label for the detail."
         )
         if windowed_ltv_note:
             st.caption(windowed_ltv_note)
