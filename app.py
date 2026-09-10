@@ -280,7 +280,10 @@ def load_roi_dash_data():
     are needed to identify each account's own FTD-month row, for
     allocating Fixed Monthly Charge - see allocate_fixed_monthly_charge().
     "Relative Month" and "Deposits count" feed the cumulative-by-cohort
-    charts - see build_relative_month_series().
+    charts - see build_relative_month_series(). "First deposit date"
+    (the view's first_deposit_processed_at) pins the start of each
+    account's own 30-day window for the 1-Month LTV row - see
+    build_one_month_ltv().
 
     Extends the statement timeout to 45s for this specific query (well
     above whatever short default the pooled connection uses), since
@@ -300,6 +303,7 @@ def load_roi_dash_data():
         query = f'''
             SELECT
                 "FTD Month", "Activity Month", "Original player ID", "Relative Month",
+                "First deposit date",
                 "Partner ID", "Campaign ID", "Landing Page Type", "Commission ID",
                 "Marketing Sms Betting", "Marketing Sms Casino",
                 "Marketing Email Betting", "Marketing Email Casino",
@@ -997,6 +1001,177 @@ def deduction_basis_labels(include_affiliate_costs_in_ltv, include_fixed_costs):
     return f"Sum of Deductions{suffix}", f"Profit{suffix}", f"Player LTV{suffix}"
 
 
+# The window the 1-Month LTV row measures, counted inclusively from
+# each account's own First deposit date (so day 1 is the FTD day).
+ONE_MONTH_LTV_DAYS = 30
+
+
+def row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs):
+    """
+    Profit for each INDIVIDUAL row of the view, on whichever basis the
+    two sidebar toggles are set to - the same formula build_cohort_table()
+    applies to column sums, just left un-aggregated so rows can be
+    weighted before they're summed.
+
+    Valid at row level because every component of Profit is genuinely
+    row-level in the source view: the pools (duties, provider fees,
+    admin fees, processing fees) are all apportioned to individual rows
+    upstream, and Allocated Fixed Monthly Charge is apportioned by this
+    app before any of this runs.
+    """
+    def c(col):
+        return df[col] if col in df.columns else 0.0
+
+    total_ggr = c("Casino GGR") + c("SB GGR") + c("SB Correction")
+    total_bonus = c("Free Spins Payout") + c("Free Bet Payout") + c("BOG Bonus") + c("Lucky Bonus")
+    taxes = c("RGD Duty") + c("GBD Duty") + c("HBLB Levy") + c("Statutory Levy")
+    other_fees = (
+        c("Data Provider Fees") + c("Casino Provider Fee") + c("Live Casino Provider Fee")
+        + c("Virtuals Provider Fee") + c("Trading Adjustments") + c("Estimated Processing Fees")
+    )
+    if include_fixed_costs:
+        other_fees = other_fees + c("Admin/Platform Fees")
+
+    affiliate_costs = (
+        c("Actual_Fixed_Fee") + c("Actual_RS") + c("Allocated Fixed Monthly Charge")
+    ) * 1.2  # the same 20% VAT the cohort table's VAT row applies
+
+    deductions = taxes + other_fees
+    if include_affiliate_costs_in_ltv:
+        deductions = deductions + affiliate_costs
+
+    return total_ggr - total_bonus - deductions
+
+
+def build_one_month_ltv(
+    df, months, include_affiliate_costs_in_ltv, include_fixed_costs, as_of=None
+):
+    """
+    Each cohort's Player LTV over the first ONE_MONTH_LTV_DAYS days of
+    each account's life, windowed from that account's own "First deposit
+    date". Returns (series indexed by `months`, note-or-None).
+
+    THE VIEW HAS NO DAILY GRAIN, so this is a day-WEIGHTED blend of
+    monthly rows rather than a true daily cut. Per account:
+
+      - Relative Month 1 (their own FTD calendar month) counts at FULL
+        weight. It is entirely inside the window by construction - the
+        account did not exist before its FTD - so pro-rating it by days
+        would discount revenue that all happened inside those days.
+      - Each LATER month counts at (days of the window falling in that
+        month) / (days in that month). Here the account WAS live for the
+        whole month, so a day share is the right apportionment.
+      - Months past the end of the window count zero.
+
+    The one assumption is that a later month's revenue is spread evenly
+    across its days. It is not - a young cohort front-loads - and the
+    window always covers that month's EARLIEST days, so this reads
+    slightly LOW. The direction of the bias is at least stable across
+    cohorts, so month-on-month comparison holds up better than the
+    absolute figure does.
+
+    A third relative month is included in the weighting because a
+    31st-of-the-month FTD followed by a 28-day February spills two days
+    past Relative Month 2. It's zero for almost every account.
+
+    MATURITY: a cohort is shown only once its LAST possible account (an
+    FTD on the final day of that month) has had a full window of
+    completed data behind it. Data is treated as complete through the
+    end of the last fully elapsed calendar month, since the current
+    month is always partial - so a cohort appears roughly two months
+    after it closes. Immature cohorts get NaN, which renders blank,
+    rather than a partial figure that would read as a genuinely low LTV.
+
+    Accounts with no "First deposit date" are dropped from BOTH the
+    numerator and the denominator - their window can't be placed at all,
+    and leaving them in the denominator would understate every cohort
+    they appear in. The returned note reports how many, since a large
+    number would mean this row is describing a self-selected subset.
+    """
+    empty = pd.Series(index=pd.Index(months, name="FTD Month"), dtype=float)
+    required = {"First deposit date", "Original player ID", "Relative Month", "FTD Month"}
+    if df.empty or not required.issubset(df.columns):
+        return empty, None
+
+    account_key = df["Original player ID"].astype(str)
+    ftd_dates = to_local_naive_date(df["First deposit date"])
+
+    # One FTD date per account - earliest, matching the MIN() the
+    # lifecycle queries use, since the view repeats the column across
+    # every (activity month, commission) row of an account and they can
+    # disagree.
+    per_account = (
+        pd.DataFrame({"account": account_key, "ftd_date": ftd_dates})
+        .dropna(subset=["ftd_date"])
+        .groupby("account")["ftd_date"]
+        .min()
+    )
+
+    n_accounts = int(account_key.nunique())
+    n_dropped = n_accounts - len(per_account)
+    note = (
+        f"1-Month LTV excludes {n_dropped:,} of {n_accounts:,} accounts with no "
+        "recorded first deposit date."
+        if n_dropped else None
+    )
+
+    if per_account.empty:
+        return empty, note
+
+    # Day-weights per account, one column per relative month.
+    ftd_period = per_account.dt.to_period("M")
+    days_left_in_ftd_month = (
+        ftd_period.dt.end_time.dt.normalize() - per_account
+    ).dt.days + 1
+
+    weights = {1: pd.Series(1.0, index=per_account.index)}
+    remaining = (ONE_MONTH_LTV_DAYS - days_left_in_ftd_month).clip(lower=0)
+    for relative_month in (2, 3):
+        days_in_month = (ftd_period + (relative_month - 1)).dt.end_time.dt.day
+        weights[relative_month] = remaining.clip(upper=days_in_month) / days_in_month
+        remaining = (remaining - days_in_month).clip(lower=0)
+
+    relative_month_col = pd.to_numeric(df["Relative Month"], errors="coerce").round()
+    row_weights = pd.Series(0.0, index=df.index)
+    for relative_month, account_weights in weights.items():
+        mask = relative_month_col == relative_month
+        if mask.any():
+            row_weights.loc[mask] = (
+                account_key[mask].map(account_weights).fillna(0.0).to_numpy()
+            )
+
+    # Accounts with no usable FTD date leave the denominator as well as
+    # the numerator - see docstring.
+    has_ftd_date = account_key.isin(per_account.index)
+    scoped = df[has_ftd_date]
+
+    weighted_profit = (
+        (row_level_profit(scoped, include_affiliate_costs_in_ltv, include_fixed_costs)
+         * row_weights[has_ftd_date])
+        .groupby(scoped["FTD Month"])
+        .sum()
+    )
+    ftd_count = scoped.groupby("FTD Month")["FTD Count"].sum()
+
+    ltv = (weighted_profit / ftd_count.replace(0, pd.NA)).reindex(months)
+    ltv = pd.to_numeric(ltv, errors="coerce")
+
+    # Blank out cohorts whose window hasn't finished - see docstring.
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+    data_complete_to = (as_of_ts.to_period("M") - 1).end_time.normalize()
+    for month in months:
+        year, month_number = month_sort_key(month)
+        if (year, month_number) == (0, 0):
+            ltv.loc[month] = float("nan")
+            continue
+        cohort_end = pd.Period(freq="M", year=year, month=month_number).end_time.normalize()
+        if cohort_end + pd.Timedelta(days=ONE_MONTH_LTV_DAYS - 1) > data_complete_to:
+            ltv.loc[month] = float("nan")
+
+    ltv.index.name = "FTD Month"
+    return ltv, note
+
+
 def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0):
     """
     Groups the (already-filtered) dataframe by FTD Month and computes
@@ -1031,16 +1206,18 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     with 1 FTD and negligible GGR right at the edge of the data) rather
     than a hardcoded exclusion of one specific month.
 
-    Returns (table, months, total_rows, sections):
+    Returns (table, months, total_rows, sections, one_month_ltv_note):
       total_rows: set of row labels that are SUMS of other rows (Total
         GGR, Total Bonus, Total Taxes & Duties, Total Other Fees &
         Adjustments, Total Affiliate Costs, Sum of Deductions, Profit,
-        Player LTV) - styled distinctly (bold + shaded) from their
-        component rows.
+        Player LTV, 1-Month LTV) - styled distinctly (bold + shaded)
+        from their component rows.
       sections: list of (parent_row_label, [detail_row_labels]) tuples,
         defining which detail rows belong under which top-level summary
         row - used to build the expand/collapse controls and to insert
         detail rows in the right position when a section is expanded.
+      one_month_ltv_note: a caption to render under the table, or None -
+        see build_one_month_ltv().
     """
     all_months = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key, reverse=True)
 
@@ -1268,9 +1445,20 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     rows[ltv_label] = player_ltv
     total_rows.add(ltv_label)
 
+    # Sits directly under the lifetime Player LTV, on the identical
+    # basis (both toggles, same FTD Count denominator) so the two are
+    # read as the same metric at two horizons rather than as two
+    # different metrics.
+    one_month_ltv, one_month_ltv_note = build_one_month_ltv(
+        df, months, include_affiliate_costs_in_ltv, include_fixed_costs
+    )
+    one_month_ltv_label = f"1-Month LTV{ltv_label[len('Player LTV'):]}"
+    rows[one_month_ltv_label] = one_month_ltv
+    total_rows.add(one_month_ltv_label)
+
     table = pd.DataFrame(rows).T
     table = table[months]
-    return table, months, total_rows, sections
+    return table, months, total_rows, sections, one_month_ltv_note
 
 
 def build_relative_month_series(df, include_affiliate_costs_in_ltv, include_fixed_costs):
@@ -2566,6 +2754,23 @@ ROW_EXPLANATIONS = {
     ),
     "Profit": "Total GGR − Total Bonus − Sum of Deductions.",
     "Player LTV": "Profit ÷ FTD Count.",
+    "1-Month LTV": (
+        "Profit over each account's first 30 days ÷ FTD Count - same basis and same "
+        "denominator as Player LTV above, just a fixed 30-day horizon instead of "
+        "lifetime-to-date. The window starts at that account's own First deposit "
+        "date.\n\n"
+        "The view has no daily grain, so this is day-WEIGHTED rather than a true "
+        "daily cut: the account's own FTD month counts in full (it's entirely inside "
+        "the window - the account didn't exist before its FTD), and each later month "
+        "counts at days-of-window ÷ days-in-month.\n\n"
+        "That assumes a later month's revenue is spread evenly across its days. It "
+        "isn't - a young cohort front-loads, and the window always covers that "
+        "month's earliest days - so this reads slightly LOW. The bias is consistent "
+        "across cohorts, so comparing months is sounder than the absolute figure.\n\n"
+        "Blank means the cohort's last-acquired account hasn't had a full 30 days of "
+        "completed data yet. Accounts with no first deposit date are excluded from "
+        "both the numerator and the FTD Count denominator."
+    ),
 }
 
 
@@ -2863,7 +3068,7 @@ tab_cohort, tab_partner, tab_campaign, tab_commission, tab_export = st.tabs([
 ])
 
 with tab_cohort:
-    table, months, total_rows, sections = build_cohort_table(
+    table, months, total_rows, sections, one_month_ltv_note = build_cohort_table(
         filtered, include_affiliate_costs, include_fixed_costs, min_ftd_count
     )
 
@@ -2887,6 +3092,15 @@ with tab_cohort:
     ]
 
     render_cohort_table_html(table, total_rows, visible_rows)
+
+    st.caption(
+        f"1-Month LTV covers each account's first {ONE_MONTH_LTV_DAYS} days from its "
+        "own first deposit date. The view is monthly, so it's the whole FTD month "
+        "plus a day-weighted slice of the next - blank for cohorts whose window "
+        "hasn't fully elapsed. Hover the row label for the detail."
+    )
+    if one_month_ltv_note:
+        st.caption(one_month_ltv_note)
 
     if not include_fixed_costs:
         st.caption(
