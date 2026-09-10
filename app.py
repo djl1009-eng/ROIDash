@@ -44,6 +44,24 @@ in a few places - see commit history / conversation for why):
     ID). Since it's genuinely row-level once allocated, it's correctly
     included in the Partner/Campaign/Commission ranking tables too.
 
+Two sidebar toggles change what the bottom-line figures (Sum of
+Deductions, Profit, Player LTV) are made of, and both are threaded
+through EVERY view that reports them - the cohort table, the cumulative
+charts, the ranking tabs - so no two panels on the page can be on
+different bases at once:
+  - "Include Affiliate Costs in Profit / Player LTV" (default OFF)
+    adds Total Affiliate Costs into Sum of Deductions.
+  - "Include Fixed Costs in Profit / Player LTV" (default ON) keeps
+    Admin/Platform Fees inside Total Other Fees & Adjustments. That row
+    is a flat £80,000-per-Activity-Month whole-business pool
+    apportioned by share of Combined Stake, rather than a fee this
+    cohort's own activity generated, which is why it's separable at
+    all. Unticking drops it from that total and therefore from Sum of
+    Deductions, Profit and Player LTV - and hides the detail row, so
+    the visible detail rows always still add up to their parent total.
+The row labels carry the basis in force (see deduction_basis_labels()),
+so an exported screenshot can't be misread as the default one.
+
 The "30 Days % of Players Still Depositing" chart at the bottom of the
 FTD Cohort View is fed by a SEPARATE query (see
 load_deposit_lifecycle_data()) joining each account's FTD timestamp to
@@ -952,7 +970,34 @@ def bucket_landing_page_type(series):
     return series.map(to_label)
 
 
-def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
+def deduction_basis_labels(include_affiliate_costs_in_ltv, include_fixed_costs):
+    """
+    The labels for the three bottom-line figures (Sum of Deductions,
+    Profit, Player LTV), given which of the two inclusion toggles are
+    on. Centralised here so the cohort table and the ranking tabs can't
+    describe the same basis two different ways, and so adding a third
+    toggle later means changing one function rather than four.
+
+    Affiliate Costs is stated either way, since it's OFF by default and
+    "excl. Affiliate Costs" is the informative reading of that default.
+    Fixed Costs is only mentioned when EXCLUDED, since it's ON by
+    default - silence means the normal, fully-loaded basis, and the
+    default labels are unchanged from before that toggle existed.
+
+    ROW_EXPLANATIONS is keyed on the UNQUALIFIED base label ("Profit",
+    not "Profit (incl. Affiliate Costs)") precisely because these
+    suffixes are combinatorial - see row_explanation().
+    """
+    qualifiers = [
+        "incl. Affiliate Costs" if include_affiliate_costs_in_ltv else "excl. Affiliate Costs"
+    ]
+    if not include_fixed_costs:
+        qualifiers.append("excl. Fixed Costs")
+    suffix = f" ({', '.join(qualifiers)})"
+    return f"Sum of Deductions{suffix}", f"Profit{suffix}", f"Player LTV{suffix}"
+
+
+def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0):
     """
     Groups the (already-filtered) dataframe by FTD Month and computes
     every row of the cohort report, organised into clear labeled
@@ -970,6 +1015,15 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     simplifies to Total GGR - Total Bonus - Sum of Deductions with no
     separate Affiliate Costs subtraction step, since Sum of Deductions
     already accounts for it conditionally.
+
+    include_fixed_costs=False additionally drops Admin/Platform Fees
+    from Total Other Fees & Adjustments, which is what carries it out
+    of Sum of Deductions, Profit and Player LTV - that row is a flat
+    whole-business pool apportioned by stake share rather than a fee
+    the cohort's own activity generated, which is what makes it
+    separable at all. The detail row is HIDDEN in that case rather than
+    shown-but-excluded, so the visible detail rows always still add up
+    to the total above them.
 
     Months whose total FTD Count (summed across every account in that
     cohort) is below min_ftd_count are dropped entirely from the result
@@ -1037,8 +1091,15 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     admin_platform_fees = col_sum("Admin/Platform Fees")
     total_other_fees = (
         sportsbook_provider_fees + casino_provider_fees
-        + trading_adjustments + processing_fees + admin_platform_fees
+        + trading_adjustments + processing_fees
     )
+    # Admin/Platform Fees is the one "fixed cost" in this section - a
+    # flat £80,000-per-Activity-Month whole-business pool apportioned by
+    # share of Combined Stake, rather than a fee this cohort's own
+    # activity generated. Dropping it from the total here is what
+    # carries it out of Sum of Deductions, Profit and Player LTV below.
+    if include_fixed_costs:
+        total_other_fees = total_other_fees + admin_platform_fees
 
     fixed_per_player = col_sum("Actual_Fixed_Fee")
     rev_share = col_sum("Actual_RS")
@@ -1052,14 +1113,12 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     # Affiliate Costs as it did before.
     if include_affiliate_costs_in_ltv:
         sum_of_deductions = total_taxes_and_duties + total_other_fees + total_affiliate_costs
-        sum_of_deductions_label = "Sum of Deductions (incl. Affiliate Costs)"
-        profit_label = "Profit (incl. Affiliate Costs)"
-        ltv_label = "Player LTV (incl. Affiliate Costs)"
     else:
         sum_of_deductions = total_taxes_and_duties + total_other_fees
-        sum_of_deductions_label = "Sum of Deductions (excl. Affiliate Costs)"
-        profit_label = "Profit (excl. Affiliate Costs)"
-        ltv_label = "Player LTV (excl. Affiliate Costs)"
+
+    sum_of_deductions_label, profit_label, ltv_label = deduction_basis_labels(
+        include_affiliate_costs_in_ltv, include_fixed_costs
+    )
 
     profit = total_ggr - total_bonus - sum_of_deductions
     player_ltv = (profit / ftd_count.replace(0, pd.NA)).fillna(0)
@@ -1179,8 +1238,18 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     rows["  Casino Provider Fees"] = casino_provider_fees
     rows["  Trading Adjustments"] = trading_adjustments
     rows["  Processing Fees"] = processing_fees
-    rows["  Admin/Platform Fees"] = admin_platform_fees
-    sections.append(("Total Other Fees & Adjustments", ["  Sportsbook Provider Fees", "  Casino Provider Fees", "  Trading Adjustments", "  Processing Fees", "  Admin/Platform Fees"]))
+    other_fees_detail_rows = [
+        "  Sportsbook Provider Fees", "  Casino Provider Fees",
+        "  Trading Adjustments", "  Processing Fees",
+    ]
+    # Hidden rather than shown-but-excluded when Fixed Costs are off, so
+    # the detail rows always reconcile with the total above them - a
+    # visible row that isn't part of its own parent's sum reads as a bug
+    # rather than as a setting.
+    if include_fixed_costs:
+        rows["  Admin/Platform Fees"] = admin_platform_fees
+        other_fees_detail_rows.append("  Admin/Platform Fees")
+    sections.append(("Total Other Fees & Adjustments", other_fees_detail_rows))
 
     # ── Affiliate Costs ──
     rows["Total Affiliate Costs"] = total_affiliate_costs
@@ -1204,7 +1273,7 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, min_ftd_count=0):
     return table, months, total_rows, sections
 
 
-def build_relative_month_series(df, include_affiliate_costs_in_ltv):
+def build_relative_month_series(df, include_affiliate_costs_in_ltv, include_fixed_costs):
     """
     Computes CUMULATIVE metrics per (FTD Month cohort, Relative Month) -
     each cohort's running total up to and including that relative month
@@ -1212,6 +1281,12 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     "cumulative by cohort" line charts. One line per FTD Month cohort,
     x-axis is Relative Month (1 = the cohort's own FTD month, 2 = the
     month after, etc.).
+
+    Both inclusion toggles are threaded through here for the same reason
+    they're threaded through the ranking tabs: the Cumulative Player LTV
+    chart sits directly under the cohort table, and the two silently
+    disagreeing about what Profit means would be worse than either
+    basis on its own.
 
     The four value series (Total GGR, Casino GGR, Sports GGR, Deposits)
     are all PER PLAYER - each cohort's cumulative total divided by its
@@ -1277,8 +1352,13 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv):
     per_period["total_taxes"] = per_period["rgd"] + per_period["gbd"] + per_period["hblb"] + per_period["statutory"]
     per_period["total_other_fees"] = (
         per_period["dpf"] + per_period["cpf"] + per_period["lcpf"] + per_period["vpf"]
-        + per_period["trading_adj"] + per_period["proc_fees"] + per_period["admin_fees"]
+        + per_period["trading_adj"] + per_period["proc_fees"]
     )
+    # Same rule as build_cohort_table(): Admin/Platform Fees is the
+    # fixed cost, in or out of Other Fees depending on the toggle.
+    if include_fixed_costs:
+        per_period["total_other_fees"] = per_period["total_other_fees"] + per_period["admin_fees"]
+
     per_period["vat"] = (per_period["fpp"] + per_period["rs"] + per_period["fmc"]) * 0.2
     per_period["affiliate_costs"] = per_period["fpp"] + per_period["rs"] + per_period["fmc"] + per_period["vat"]
 
@@ -1786,6 +1866,11 @@ def build_ltv_model_export(base_df, lifecycle_df, min_months_observed, max_accou
     costs) rather than whichever the sidebar toggle currently says, so
     the export doesn't silently inherit a UI setting - a model built on
     the wrong one would be wrong in a way that's invisible in the file.
+    admin_platform_fees is emitted separately for the same reason: it's
+    a COMPONENT of total_other_fees, not an addition to it, surfaced so
+    a model can reproduce the dashboard's "exclude Fixed Costs" basis by
+    subtracting it rather than inheriting whichever way that toggle
+    happened to be set when the file was built.
 
     FTD Count is NOT summed: it is 1 on every one of an account's
     commission rows (see allocate_fixed_monthly_charge()), so summing it
@@ -1857,6 +1942,10 @@ def build_ltv_model_export(base_df, lifecycle_df, min_months_observed, max_accou
         + g("Virtuals Provider Fee") + g("Trading Adjustments")
         + g("Estimated Processing Fees") + g("Admin/Platform Fees")
     )
+    # A COMPONENT of total_other_fees above, not an addition to it -
+    # see the docstring. Subtract it from total_other_fees to get the
+    # dashboard's "exclude Fixed Costs" basis.
+    out["admin_platform_fees"] = g("Admin/Platform Fees")
     fixed_fee, rev_share, fmc = g("Actual_Fixed_Fee"), g("Actual_RS"), g("Allocated Fixed Monthly Charge")
     out["affiliate_costs"] = fixed_fee + rev_share + fmc + (fixed_fee + rev_share + fmc) * 0.2
     out["profit_excl_affiliate"] = out["total_ggr"] - out["total_bonus"] - out["total_taxes_duties"] - out["total_other_fees"]
@@ -1887,13 +1976,21 @@ def build_ltv_model_export(base_df, lifecycle_df, min_months_observed, max_accou
     return out, note
 
 
-def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv):
+def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv, include_fixed_costs):
     """
     Per-group sums of every component the ranking tables need, plus the
     resulting Profit. Factored out so the lifetime columns and the
     ARPU-after-3-months column are computed by the SAME code on two
     different slices of data - if the profit formula ever changes, it
     can't drift between the two.
+
+    Both inclusion toggles are honoured here exactly as
+    build_cohort_table() honours them: include_fixed_costs=False drops
+    Admin/Platform Fees from Sum of Deductions, and therefore from
+    Profit and from ARPU. That keeps a partner's ranking on the same
+    basis as the cohort table above it - a partner heavy in
+    high-stake/low-margin accounts carries a large Admin/Platform Fees
+    share, so the two bases really can reorder the table.
 
     Affiliate Costs here includes "Allocated Fixed Monthly Charge" -
     now that it's genuinely row-level (see allocate_fixed_monthly_charge()),
@@ -1920,11 +2017,18 @@ def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv):
         col_sum("RGD Duty") + col_sum("GBD Duty")
         + col_sum("HBLB Levy") + col_sum("Statutory Levy")
     )
-    total_other_fees = (
-        col_sum("Data Provider Fees")
-        + col_sum("Casino Provider Fee") + col_sum("Live Casino Provider Fee") + col_sum("Virtuals Provider Fee")
-        + col_sum("Trading Adjustments") + col_sum("Estimated Processing Fees") + col_sum("Admin/Platform Fees")
-    )
+    # Built as a list so the fixed cost is added or omitted in one
+    # place, rather than as an expression that would need repeating in
+    # both branches of an if.
+    other_fee_columns = [
+        "Data Provider Fees",
+        "Casino Provider Fee", "Live Casino Provider Fee", "Virtuals Provider Fee",
+        "Trading Adjustments", "Estimated Processing Fees",
+    ]
+    if include_fixed_costs:
+        other_fee_columns.append("Admin/Platform Fees")
+    total_other_fees = sum(col_sum(c) for c in other_fee_columns)
+
     sum_of_deductions = total_taxes_and_duties + total_other_fees
 
     fixed_per_player = col_sum("Actual_Fixed_Fee")
@@ -1966,7 +2070,8 @@ def immature_ftd_months(df, maturity_months=ARPU_MATURITY_MONTHS):
     return set(months[:maturity_months])
 
 
-def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, excluded_ftd_months=frozenset()):
+def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, include_fixed_costs,
+                        excluded_ftd_months=frozenset()):
     """
     Groups the (already-filtered) dataframe by group_col (Partner ID,
     Campaign ID, or Commission ID) and computes each group's LIFETIME
@@ -1994,29 +2099,42 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, excluded_
 
     Returns (result, profit_label, arpu_label).
     """
-    lifetime = summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv)
+    lifetime = summarise_group_economics(
+        df, group_col, include_affiliate_costs_in_ltv, include_fixed_costs
+    )
 
     mature_df = df[~df["FTD Month"].isin(excluded_ftd_months)]
     if mature_df.empty:
         arpu = pd.Series(float("nan"), index=lifetime["ftd_count"].index)
     else:
-        mature = summarise_group_economics(mature_df, group_col, include_affiliate_costs_in_ltv)
+        mature = summarise_group_economics(
+            mature_df, group_col, include_affiliate_costs_in_ltv, include_fixed_costs
+        )
         mature_ftds = mature["ftd_count"].replace(0, pd.NA)
         arpu = (mature["profit"] / mature_ftds).reindex(lifetime["ftd_count"].index)
         arpu = pd.to_numeric(arpu, errors="coerce")
 
-    if include_affiliate_costs_in_ltv:
-        profit_label = "Profit (incl. Affiliate Costs)"
-        arpu_label = f"ARPU after {ARPU_MATURITY_MONTHS} months (incl. Affiliate Costs)"
-    else:
-        profit_label = "Profit (excl. Affiliate Costs)"
-        arpu_label = f"ARPU after {ARPU_MATURITY_MONTHS} months (excl. Affiliate Costs)"
+    # Same qualifier suffix the cohort table uses, so the two tabs
+    # describe an identical basis identically. ARPU borrows Profit's
+    # suffix rather than rebuilding it, for the same reason.
+    _, profit_label, _ = deduction_basis_labels(
+        include_affiliate_costs_in_ltv, include_fixed_costs
+    )
+    profit_suffix = profit_label[len("Profit"):]
+    arpu_label = f"ARPU after {ARPU_MATURITY_MONTHS} months{profit_suffix}"
+    # This table's own Sum of Deductions column NEVER includes Affiliate
+    # Costs (they have their own column beside it), so only the fixed
+    # cost qualifier is meaningful here.
+    deductions_label = (
+        "Sum of Deductions" if include_fixed_costs
+        else "Sum of Deductions (excl. Fixed Costs)"
+    )
 
     result = pd.DataFrame({
         "FTD Count": lifetime["ftd_count"],
         "Total GGR": lifetime["total_ggr"],
         "Total Bonus": lifetime["total_bonus"],
-        "Sum of Deductions": lifetime["sum_of_deductions"],
+        deductions_label: lifetime["sum_of_deductions"],
         "Affiliate Costs": lifetime["affiliate_costs"],
         profit_label: lifetime["profit"],
         arpu_label: arpu,
@@ -2190,7 +2308,7 @@ def render_cohort_table_html(table, total_rows, visible_rows):
                 "covers rows whose Campaign ID has no match in that lookup."
             )
         else:
-            explanation = ROW_EXPLANATIONS.get(row_name, "")
+            explanation = row_explanation(row_name)
         title_attr = html_module.escape(explanation).replace("\n", "&#10;") if explanation else ""
         label_html = html_module.escape(row_name)
 
@@ -2237,7 +2355,7 @@ COUNT_ROWS = {"FTD Count"} | set(ACCOUNT_STATUS_ROW_ORDER)
 # Every row not in PERCENT_ROWS or COUNT_ROWS is a currency row -
 # formatting is now driven by exclusion rather than an explicit set,
 # since row labels change dynamically (Profit/LTV's label depends on
-# the affiliate-costs toggle).
+# the affiliate-costs and fixed-costs toggles).
 
 # Hover-tooltip text for each row label, shown when hovering the row
 # name in the first column. Sourced from the original prototype
@@ -2247,6 +2365,10 @@ COUNT_ROWS = {"FTD Count"} | set(ACCOUNT_STATUS_ROW_ORDER)
 # Charge is now a flat £3,500 per FTD Month rather than the
 # spreadsheet's placeholder text; Admin/Platform Fees uses Combined
 # Stake rather than Affilka's own stake columns).
+#
+# The three bottom-line rows are keyed on their UNQUALIFIED base label
+# ("Profit", not "Profit (incl. Affiliate Costs)"), since their real
+# labels are a combination of two toggles - see row_explanation().
 ROW_EXPLANATIONS = {
     "FTD Count": "Source: Affilka API\n\nFTD count direct from Affilka.",
     "  Active": (
@@ -2326,7 +2448,10 @@ ROW_EXPLANATIONS = {
     ),
     "Total Other Fees & Adjustments": (
         "Sportsbook Provider Fees + Casino Provider Fees + Trading Adjustments + "
-        "Processing Fees + Admin/Platform Fees."
+        "Processing Fees + Admin/Platform Fees.\n\n"
+        "Admin/Platform Fees is included only while 'Include Fixed Costs in Profit / "
+        "Player LTV' is ticked - when it isn't, that row is dropped from this total "
+        "and hidden from the detail rows below it."
     ),
     "  Sportsbook Provider Fees": "Source: All Bets Master Log\n\nSum of the Data Provider Fees column.",
     "  Casino Provider Fees": (
@@ -2350,7 +2475,10 @@ ROW_EXPLANATIONS = {
         "Source: Affilka API + Customer Trading Data Monthly\n\n"
         "pool = £80,000 flat, per Activity Month, spanning the whole business\n"
         "account's share = pool × (this account's Combined Stake ÷ whole-business Combined "
-        "Stake, that month)."
+        "Stake, that month)\n\n"
+        "This is the row governed by the 'Include Fixed Costs in Profit / Player LTV' "
+        "sidebar toggle - untick it and this row is dropped from the total above, and "
+        "therefore from Sum of Deductions, Profit and Player LTV."
     ),
     "Total Affiliate Costs": "fixed_per_player + Rev Share + Fixed Monthly Charge + VAT.",
     "  fixed_per_player (FTD Month)": (
@@ -2373,18 +2501,39 @@ ROW_EXPLANATIONS = {
     "  Fixed Monthly Charge": (
         "Source: hardcoded, £3,500 per FTD Month\n\n"
         "Split equally across that month's distinct new FTDs, written onto each account's own "
-        "FTD-month row only - every later Activity Month for that account is £0."
+        "FTD-month row only - every later Activity Month for that account is £0.\n\n"
+        "Note this sits inside Total Affiliate Costs and is governed by the AFFILIATE "
+        "costs toggle, not the Fixed Costs one - despite the name, it's an affiliate "
+        "acquisition charge rather than a platform fixed cost."
     ),
     "  VAT": "20% × (fixed_per_player + Rev Share + Fixed Monthly Charge).",
-    "Sum of Deductions (excl. Affiliate Costs)": "Total Taxes & Duties + Total Other Fees & Adjustments.",
-    "Sum of Deductions (incl. Affiliate Costs)": (
-        "Total Taxes & Duties + Total Other Fees & Adjustments + Total Affiliate Costs."
+    # Keyed on the base label - the "(incl./excl. ...)" qualifier that
+    # the real row carries varies with both sidebar toggles, so
+    # row_explanation() strips it before looking up here.
+    "Sum of Deductions": (
+        "Total Taxes & Duties + Total Other Fees & Adjustments, plus Total Affiliate "
+        "Costs when 'Include Affiliate Costs in Profit / Player LTV' is ticked.\n\n"
+        "Admin/Platform Fees drops out of Total Other Fees & Adjustments, and so out "
+        "of this figure, when 'Include Fixed Costs in Profit / Player LTV' is "
+        "unticked. The row label states which basis is in force."
     ),
-    "Profit (excl. Affiliate Costs)": "Total GGR − Total Bonus − Sum of Deductions.",
-    "Profit (incl. Affiliate Costs)": "Total GGR − Total Bonus − Sum of Deductions.",
-    "Player LTV (excl. Affiliate Costs)": "Profit ÷ FTD Count.",
-    "Player LTV (incl. Affiliate Costs)": "Profit ÷ FTD Count.",
+    "Profit": "Total GGR − Total Bonus − Sum of Deductions.",
+    "Player LTV": "Profit ÷ FTD Count.",
 }
+
+
+def row_explanation(row_name):
+    """
+    The hover text for a row label.
+
+    Falls back to the row's UNQUALIFIED base label - everything before
+    the first " (" - so the three bottom-line rows need one entry each
+    rather than one per combination of the two inclusion toggles. Adding
+    a third toggle wouldn't need any new entries at all.
+    """
+    if row_name in ROW_EXPLANATIONS:
+        return ROW_EXPLANATIONS[row_name]
+    return ROW_EXPLANATIONS.get(row_name.split(" (")[0], "")
 
 
 # ── MAIN APP ──────────────────────────────────────────────────────────
@@ -2551,6 +2700,20 @@ include_affiliate_costs = st.sidebar.checkbox(
     ),
 )
 
+include_fixed_costs = st.sidebar.checkbox(
+    "Include Fixed Costs in Profit / Player LTV",
+    value=True,
+    help=(
+        "On by default. 'Fixed Costs' here means the Admin/Platform Fees row - "
+        "a flat £80,000-per-Activity-Month whole-business pool, apportioned to "
+        "accounts by share of Combined Stake rather than generated by their own "
+        "activity. Untick to drop it from Total Other Fees & Adjustments, and "
+        "therefore from Sum of Deductions, Profit and Player LTV (here and on "
+        "the ranking tabs). The Admin/Platform Fees detail row is hidden while "
+        "it's off, so the detail rows still add up to the total above them."
+    ),
+)
+
 st.sidebar.divider()
 min_ftd_count = st.sidebar.number_input(
     "Hide FTD-cohort months below this FTD Count",
@@ -2653,7 +2816,9 @@ tab_cohort, tab_partner, tab_campaign, tab_commission, tab_export = st.tabs([
 ])
 
 with tab_cohort:
-    table, months, total_rows, sections = build_cohort_table(filtered, include_affiliate_costs, min_ftd_count)
+    table, months, total_rows, sections = build_cohort_table(
+        filtered, include_affiliate_costs, include_fixed_costs, min_ftd_count
+    )
 
     # Map each detail row label back to its parent section, so a
     # section only shows its detail rows when explicitly expanded.
@@ -2676,6 +2841,13 @@ with tab_cohort:
 
     render_cohort_table_html(table, total_rows, visible_rows)
 
+    if not include_fixed_costs:
+        st.caption(
+            "Fixed Costs are excluded: Admin/Platform Fees is out of Total Other "
+            "Fees & Adjustments, Sum of Deductions, Profit and Player LTV, and its "
+            "detail row is hidden so the remaining detail rows still reconcile."
+        )
+
     # ── CUMULATIVE BY RELATIVE MONTH CHARTS ──
     # One line per FTD Month cohort, x-axis is Relative Month (1 =
     # the cohort's own FTD month). Uses `filtered` (not the full `df`)
@@ -2685,10 +2857,16 @@ with tab_cohort:
     # uses), so a near-empty/junk cohort with a wildly distorted LTV
     # (e.g. a single account with FTD Count = 1) doesn't drag the
     # charts' Y-axis scale away from every other cohort's real values.
+    #
+    # Both inclusion toggles are passed through for the same reason:
+    # the Cumulative Player LTV chart sits directly under the table, so
+    # the two must be on the same basis.
     st.divider()
     st.subheader("Cumulative by FTD cohort")
     chart_data = filtered[filtered["FTD Month"].isin(months)]
-    relative_month_charts = build_relative_month_series(chart_data, include_affiliate_costs)
+    relative_month_charts = build_relative_month_series(
+        chart_data, include_affiliate_costs, include_fixed_costs
+    )
 
     chart_pairs = list(relative_month_charts.items())
 
@@ -2929,8 +3107,15 @@ def render_ranking_tab(tab, group_col, label):
             "across each FTD Month's new signups and attributed to their own "
             "acquisition month."
         )
+        if not include_fixed_costs:
+            st.caption(
+                "Fixed Costs are excluded: Admin/Platform Fees is out of Sum of "
+                "Deductions, Profit and ARPU here too, matching the FTD Cohort View. "
+                "This can reorder the table - a partner heavy in high-stake accounts "
+                "carries a larger share of that pool than one that isn't."
+            )
         result, profit_label, arpu_label = build_ranking_table(
-            filtered, group_col, include_affiliate_costs, excluded_ftd_months
+            filtered, group_col, include_affiliate_costs, include_fixed_costs, excluded_ftd_months
         )
         if group_col == "Partner ID" and partner_names:
             # Renamed AFTER grouping and ranking, never before - grouping
@@ -2951,6 +3136,13 @@ with tab_export:
         "modelling. Account IDs are replaced with a stable hash - which is "
         "pseudonymisation, not anonymisation: the mapping is rebuildable by "
         "anyone holding the ID list, so treat the file as confidential."
+    )
+    st.caption(
+        "Neither the Affiliate Costs nor the Fixed Costs toggle applies here - "
+        "the file carries both profit definitions, plus admin_platform_fees as "
+        "its own column (a component of total_other_fees, not an addition to "
+        "it), so a model can pick its own basis rather than inheriting whatever "
+        "the sidebar happened to say when the file was built."
     )
 
     export_min_months = st.number_input(
