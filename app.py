@@ -282,8 +282,8 @@ def load_roi_dash_data():
     "Relative Month" and "Deposits count" feed the cumulative-by-cohort
     charts - see build_relative_month_series(). "First deposit date"
     (the view's first_deposit_processed_at) pins the start of each
-    account's own 30-day window for the 1-Month LTV row - see
-    build_one_month_ltv().
+    account's own 30/90-day window for the 1-Month and 3-Month LTV rows
+    - see build_windowed_ltv().
 
     Extends the statement timeout to 45s for this specific query (well
     above whatever short default the pooled connection uses), since
@@ -1001,9 +1001,10 @@ def deduction_basis_labels(include_affiliate_costs_in_ltv, include_fixed_costs):
     return f"Sum of Deductions{suffix}", f"Profit{suffix}", f"Player LTV{suffix}"
 
 
-# The window the 1-Month LTV row measures, counted inclusively from
+# The windows the two LTV detail rows measure, counted inclusively from
 # each account's own First deposit date (so day 1 is the FTD day).
 ONE_MONTH_LTV_DAYS = 30
+THREE_MONTH_LTV_DAYS = 90
 
 
 def row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs):
@@ -1043,13 +1044,18 @@ def row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs):
     return total_ggr - total_bonus - deductions
 
 
-def build_one_month_ltv(
-    df, months, include_affiliate_costs_in_ltv, include_fixed_costs, as_of=None
+def build_windowed_ltv(
+    df, months, window_days, include_affiliate_costs_in_ltv, include_fixed_costs, as_of=None
 ):
     """
-    Each cohort's Player LTV over the first ONE_MONTH_LTV_DAYS days of
-    each account's life, windowed from that account's own "First deposit
-    date". Returns (series indexed by `months`, note-or-None).
+    Each cohort's Player LTV over the first `window_days` days of each
+    account's life, windowed from that account's own "First deposit
+    date". Returns (series indexed by `months`, (n_dropped, n_accounts)).
+
+    Parameterised on the window rather than written once per horizon, so
+    the 30-day and 90-day rows are the same calculation at two lengths
+    and can't drift apart - and a fourth horizon later is one call, not
+    another copy of this logic.
 
     THE VIEW HAS NO DAILY GRAIN, so this is a day-WEIGHTED blend of
     monthly rows rather than a true daily cut. Per account:
@@ -1065,33 +1071,37 @@ def build_one_month_ltv(
 
     The one assumption is that a later month's revenue is spread evenly
     across its days. It is not - a young cohort front-loads - and the
-    window always covers that month's EARLIEST days, so this reads
+    window always covers those months' EARLIEST days, so this reads
     slightly LOW. The direction of the bias is at least stable across
     cohorts, so month-on-month comparison holds up better than the
-    absolute figure does.
+    absolute figure does. It also matters LESS the longer the window:
+    at 90 days only the final partial month is affected, against two of
+    roughly two months at 30 days.
 
-    A third relative month is included in the weighting because a
-    31st-of-the-month FTD followed by a 28-day February spills two days
-    past Relative Month 2. It's zero for almost every account.
+    Enough relative months are weighted to cover the window whatever the
+    calendar does - a 31st-of-the-month FTD followed by a short month
+    spills further than the arithmetic suggests - and the loop stops as
+    soon as no account has window left.
 
     MATURITY: a cohort is shown only once its LAST possible account (an
     FTD on the final day of that month) has had a full window of
     completed data behind it. Data is treated as complete through the
     end of the last fully elapsed calendar month, since the current
-    month is always partial - so a cohort appears roughly two months
-    after it closes. Immature cohorts get NaN, which renders blank,
-    rather than a partial figure that would read as a genuinely low LTV.
+    month is always partial. Immature cohorts get NaN, which renders
+    blank, rather than a partial figure that would read as a genuinely
+    low LTV.
 
     Accounts with no "First deposit date" are dropped from BOTH the
     numerator and the denominator - their window can't be placed at all,
     and leaving them in the denominator would understate every cohort
-    they appear in. The returned note reports how many, since a large
-    number would mean this row is describing a self-selected subset.
+    they appear in. The returned counts let the caller report how many,
+    since a large number would mean these rows describe a self-selected
+    subset.
     """
     empty = pd.Series(index=pd.Index(months, name="FTD Month"), dtype=float)
     required = {"First deposit date", "Original player ID", "Relative Month", "FTD Month"}
     if df.empty or not required.issubset(df.columns):
-        return empty, None
+        return empty, (0, 0)
 
     account_key = df["Original player ID"].astype(str)
     ftd_dates = to_local_naive_date(df["First deposit date"])
@@ -1108,25 +1118,25 @@ def build_one_month_ltv(
     )
 
     n_accounts = int(account_key.nunique())
-    n_dropped = n_accounts - len(per_account)
-    note = (
-        f"1-Month LTV excludes {n_dropped:,} of {n_accounts:,} accounts with no "
-        "recorded first deposit date."
-        if n_dropped else None
-    )
+    dropped = (n_accounts - len(per_account), n_accounts)
 
     if per_account.empty:
-        return empty, note
+        return empty, dropped
 
-    # Day-weights per account, one column per relative month.
+    # Day-weights per account, one entry per relative month.
     ftd_period = per_account.dt.to_period("M")
     days_left_in_ftd_month = (
         ftd_period.dt.end_time.dt.normalize() - per_account
     ).dt.days + 1
 
     weights = {1: pd.Series(1.0, index=per_account.index)}
-    remaining = (ONE_MONTH_LTV_DAYS - days_left_in_ftd_month).clip(lower=0)
-    for relative_month in (2, 3):
+    remaining = (window_days - days_left_in_ftd_month).clip(lower=0)
+    # Upper bound only - the break below is what actually ends this.
+    # 28 is the shortest possible month, so this can never stop short.
+    max_relative_month = window_days // 28 + 3
+    for relative_month in range(2, max_relative_month + 1):
+        if not (remaining > 0).any():
+            break
         days_in_month = (ftd_period + (relative_month - 1)).dt.end_time.dt.day
         weights[relative_month] = remaining.clip(upper=days_in_month) / days_in_month
         remaining = (remaining - days_in_month).clip(lower=0)
@@ -1165,11 +1175,11 @@ def build_one_month_ltv(
             ltv.loc[month] = float("nan")
             continue
         cohort_end = pd.Period(freq="M", year=year, month=month_number).end_time.normalize()
-        if cohort_end + pd.Timedelta(days=ONE_MONTH_LTV_DAYS - 1) > data_complete_to:
+        if cohort_end + pd.Timedelta(days=window_days - 1) > data_complete_to:
             ltv.loc[month] = float("nan")
 
     ltv.index.name = "FTD Month"
-    return ltv, note
+    return ltv, dropped
 
 
 def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0):
@@ -1206,18 +1216,21 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     with 1 FTD and negligible GGR right at the edge of the data) rather
     than a hardcoded exclusion of one specific month.
 
-    Returns (table, months, total_rows, sections, one_month_ltv_note):
+    Returns (table, months, total_rows, sections, windowed_ltv_note):
       total_rows: set of row labels that are SUMS of other rows (Total
         GGR, Total Bonus, Total Taxes & Duties, Total Other Fees &
         Adjustments, Total Affiliate Costs, Sum of Deductions, Profit,
-        Player LTV, 1-Month LTV) - styled distinctly (bold + shaded)
-        from their component rows.
+        Player LTV) - styled distinctly (bold + shaded) from their
+        component rows.
       sections: list of (parent_row_label, [detail_row_labels]) tuples,
         defining which detail rows belong under which top-level summary
         row - used to build the expand/collapse controls and to insert
         detail rows in the right position when a section is expanded.
-      one_month_ltv_note: a caption to render under the table, or None -
-        see build_one_month_ltv().
+        Player LTV's detail rows are the exception to "details sum to
+        the parent": 1-Month and 3-Month LTV are the same metric over
+        shorter windows, not components of the lifetime figure.
+      windowed_ltv_note: a caption to render under the table, or None -
+        see build_windowed_ltv().
     """
     all_months = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key, reverse=True)
 
@@ -1445,20 +1458,40 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     rows[ltv_label] = player_ltv
     total_rows.add(ltv_label)
 
-    # Sits directly under the lifetime Player LTV, on the identical
-    # basis (both toggles, same FTD Count denominator) so the two are
-    # read as the same metric at two horizons rather than as two
-    # different metrics.
-    one_month_ltv, one_month_ltv_note = build_one_month_ltv(
-        df, months, include_affiliate_costs_in_ltv, include_fixed_costs
+    # Shorter horizons hang off Player LTV as collapsed detail rows, so
+    # the bottom line stays a single number by default. They are NOT
+    # components that sum to the parent - unlike every other section
+    # here, these are the SAME metric measured over shorter windows, so
+    # the parent is the largest of the three rather than their total.
+    #
+    # Labels are left unqualified: they inherit the basis stated on the
+    # parent row directly above them, and repeating "(excl. Affiliate
+    # Costs, excl. Fixed Costs)" on all three would be unreadable.
+    windowed_ltv_rows = []
+    dropped_accounts = (0, 0)
+    for label, window_days in (
+        ("  1-Month LTV", ONE_MONTH_LTV_DAYS),
+        ("  3-Month LTV", THREE_MONTH_LTV_DAYS),
+    ):
+        series, dropped_accounts = build_windowed_ltv(
+            df, months, window_days, include_affiliate_costs_in_ltv, include_fixed_costs
+        )
+        rows[label] = series
+        windowed_ltv_rows.append(label)
+    sections.append((ltv_label, windowed_ltv_rows))
+
+    # Both windows drop the same accounts (the ones with no first
+    # deposit date at all), so this is reported once for both rows.
+    n_dropped, n_accounts = dropped_accounts
+    windowed_ltv_note = (
+        f"1-Month and 3-Month LTV exclude {n_dropped:,} of {n_accounts:,} accounts "
+        "with no recorded first deposit date."
+        if n_dropped else None
     )
-    one_month_ltv_label = f"1-Month LTV{ltv_label[len('Player LTV'):]}"
-    rows[one_month_ltv_label] = one_month_ltv
-    total_rows.add(one_month_ltv_label)
 
     table = pd.DataFrame(rows).T
     table = table[months]
-    return table, months, total_rows, sections, one_month_ltv_note
+    return table, months, total_rows, sections, windowed_ltv_note
 
 
 def build_relative_month_series(df, include_affiliate_costs_in_ltv, include_fixed_costs):
@@ -2754,22 +2787,32 @@ ROW_EXPLANATIONS = {
     ),
     "Profit": "Total GGR − Total Bonus − Sum of Deductions.",
     "Player LTV": "Profit ÷ FTD Count.",
-    "1-Month LTV": (
+    "  1-Month LTV": (
         "Profit over each account's first 30 days ÷ FTD Count - same basis and same "
         "denominator as Player LTV above, just a fixed 30-day horizon instead of "
-        "lifetime-to-date. The window starts at that account's own First deposit "
-        "date.\n\n"
-        "The view has no daily grain, so this is day-WEIGHTED rather than a true "
-        "daily cut: the account's own FTD month counts in full (it's entirely inside "
-        "the window - the account didn't exist before its FTD), and each later month "
-        "counts at days-of-window ÷ days-in-month.\n\n"
+        "lifetime-to-date. NOT a component of Player LTV: it's the same metric over a "
+        "shorter window, so the parent row is the larger figure, not the total.\n\n"
+        "The window starts at that account's own First deposit date. The view has no "
+        "daily grain, so this is day-WEIGHTED rather than a true daily cut: the "
+        "account's own FTD month counts in full (it's entirely inside the window - the "
+        "account didn't exist before its FTD), and each later month counts at "
+        "days-of-window ÷ days-in-month.\n\n"
         "That assumes a later month's revenue is spread evenly across its days. It "
-        "isn't - a young cohort front-loads, and the window always covers that "
-        "month's earliest days - so this reads slightly LOW. The bias is consistent "
+        "isn't - a young cohort front-loads, and the window always covers those "
+        "months' earliest days - so this reads slightly LOW. The bias is consistent "
         "across cohorts, so comparing months is sounder than the absolute figure.\n\n"
         "Blank means the cohort's last-acquired account hasn't had a full 30 days of "
         "completed data yet. Accounts with no first deposit date are excluded from "
         "both the numerator and the FTD Count denominator."
+    ),
+    "  3-Month LTV": (
+        "Profit over each account's first 90 days ÷ FTD Count - identical calculation "
+        "to 1-Month LTV, just a longer window. See that row for the method and its "
+        "caveats.\n\n"
+        "The even-spread assumption bites LESS here: at 90 days only the final partial "
+        "month is apportioned, against roughly one of two months at 30 days.\n\n"
+        "Blank until the cohort's last-acquired account has had a full 90 days of "
+        "completed data, so this fills in about two months later than the 1-Month row."
     ),
 }
 
@@ -3068,7 +3111,7 @@ tab_cohort, tab_partner, tab_campaign, tab_commission, tab_export = st.tabs([
 ])
 
 with tab_cohort:
-    table, months, total_rows, sections, one_month_ltv_note = build_cohort_table(
+    table, months, total_rows, sections, windowed_ltv_note = build_cohort_table(
         filtered, include_affiliate_costs, include_fixed_costs, min_ftd_count
     )
 
@@ -3093,14 +3136,18 @@ with tab_cohort:
 
     render_cohort_table_html(table, total_rows, visible_rows)
 
-    st.caption(
-        f"1-Month LTV covers each account's first {ONE_MONTH_LTV_DAYS} days from its "
-        "own first deposit date. The view is monthly, so it's the whole FTD month "
-        "plus a day-weighted slice of the next - blank for cohorts whose window "
-        "hasn't fully elapsed. Hover the row label for the detail."
-    )
-    if one_month_ltv_note:
-        st.caption(one_month_ltv_note)
+    # Only shown while the Player LTV section is open - otherwise it's a
+    # caption about rows that aren't on screen.
+    if any(row.strip() in {"1-Month LTV", "3-Month LTV"} for row in visible_rows):
+        st.caption(
+            f"1-Month and 3-Month LTV cover each account's first {ONE_MONTH_LTV_DAYS} "
+            f"and {THREE_MONTH_LTV_DAYS} days from its own first deposit date, on the "
+            "same basis as Player LTV above. The view is monthly, so each is the whole "
+            "FTD month plus day-weighted slices of the months after it - blank where "
+            "the window hasn't fully elapsed. Hover a row label for the detail."
+        )
+        if windowed_ltv_note:
+            st.caption(windowed_ltv_note)
 
     if not include_fixed_costs:
         st.caption(
