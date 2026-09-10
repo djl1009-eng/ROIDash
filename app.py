@@ -1992,6 +1992,11 @@ def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv, inc
     high-stake/low-margin accounts carries a large Admin/Platform Fees
     share, so the two bases really can reorder the table.
 
+    fixed_per_player is returned as its own sum, on top of being folded
+    into affiliate_costs, so Estimated CPA can be derived from the same
+    slice this function was handed rather than recomputed against a
+    differently-filtered frame - see build_ranking_table().
+
     Affiliate Costs here includes "Allocated Fixed Monthly Charge" -
     now that it's genuinely row-level (see allocate_fixed_monthly_charge()),
     summing it by group_col is exactly as valid as summing Casino GGR by
@@ -2048,6 +2053,7 @@ def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv, inc
         "total_bonus": total_bonus,
         "sum_of_deductions": sum_of_deductions,
         "affiliate_costs": affiliate_costs,
+        "fixed_per_player": fixed_per_player,
         "profit": profit,
     }
 
@@ -2097,7 +2103,15 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, include_f
     measurable yet", displayed as n/a and sorted last, not a zero that
     would read as a group that earned nothing.
 
-    Returns (result, profit_label, arpu_label).
+    Estimated CPA is the group's Actual_Fixed_Fee (the real CPA cost
+    from the CPA By Cohort spreadsheet, per fixed_per_player's tooltip)
+    plus 20% VAT, divided by its FTD Count - the average VAT-inclusive
+    acquisition fee per player acquired. It covers ONLY that fee and its
+    VAT, not the whole of Affiliate Costs: Rev Share and Fixed Monthly
+    Charge (and their share of the VAT) are excluded, so it is a CPA
+    rate rather than a fully-loaded cost of acquisition.
+
+    Returns (result, profit_label, arpu_label, cpa_label).
     """
     lifetime = summarise_group_economics(
         df, group_col, include_affiliate_costs_in_ltv, include_fixed_costs
@@ -2130,6 +2144,36 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, include_f
         else "Sum of Deductions (excl. Fixed Costs)"
     )
 
+    # Estimated CPA - each group's Actual_Fixed_Fee, plus the 20% VAT
+    # charged on it, summed and divided by its FTD Count: the average
+    # VAT-inclusive acquisition fee per player acquired, NOT a plain
+    # .mean() of the column. Actual_Fixed_Fee is non-zero only on an
+    # account's own FTD-month row and £0 on every later row, so a
+    # row-level mean would divide by every activity month the cohort has
+    # been alive and understate CPA by a factor of the average cohort
+    # age.
+    #
+    # The 20% is the same rate the cohort table's VAT row applies, just
+    # to the fixed-fee component alone rather than to fixed fee + Rev
+    # Share + Fixed Monthly Charge together - so this figure is a strict
+    # subset of the VAT in Affiliate Costs, never additional to it.
+    #
+    # Deliberately on the LIFETIME slice, like every other column here
+    # except ARPU. That means it is NOT directly comparable with the
+    # ARPU column beside it - ARPU drops the newest cohorts, this
+    # doesn't, so a partner whose rates changed recently will show a CPA
+    # that includes cohorts the ARPU excludes. Swap lifetime[...] for
+    # mature[...] below to put the two on the same cohort basis.
+    #
+    # Unaffected by BOTH inclusion toggles: those govern what counts as
+    # a deduction, whereas this is a stated cost per acquisition either
+    # way.
+    estimated_cpa = pd.to_numeric(
+        (lifetime["fixed_per_player"] * 1.2) / lifetime["ftd_count"].replace(0, pd.NA),
+        errors="coerce",
+    )
+    cpa_label = "Estimated CPA"
+
     result = pd.DataFrame({
         "FTD Count": lifetime["ftd_count"],
         "Total GGR": lifetime["total_ggr"],
@@ -2138,29 +2182,32 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, include_f
         "Affiliate Costs": lifetime["affiliate_costs"],
         profit_label: lifetime["profit"],
         arpu_label: arpu,
+        cpa_label: estimated_cpa,
     })
     result = result.sort_values(arpu_label, ascending=False, na_position="last")
     result.index.name = group_col
-    return result, profit_label, arpu_label
+    return result, profit_label, arpu_label, cpa_label
 
 
-def format_ranking_table(result, profit_label, arpu_label):
+def format_ranking_table(result, profit_label, arpu_label, cpa_label=None):
     """
     Currency-formats every column except FTD Count (a plain integer
     count), returning a display-ready copy. Same .astype(object)
     upfront pattern as the cohort table, for the same reason (newer
     pandas rejects writing formatted strings into a float64 column).
 
-    A NaN ARPU renders as "n/a" rather than the blank format_currency()
-    would give, since a blank cell in a currency column reads as zero at
-    a glance - and "this group has no cohort old enough to measure" is a
-    different statement from "this group earned nothing".
+    A NaN in the ARPU or Estimated CPA column renders as "n/a" rather
+    than the blank format_currency() would give, since a blank cell in a
+    currency column reads as zero at a glance - and "no cohort old
+    enough to measure" / "no FTDs to divide by" is a different statement
+    from "this group earned nothing" or "cost nothing".
     """
+    na_labels = {arpu_label} | ({cpa_label} if cpa_label else set())
     display = result.astype(object)
     for col in display.columns:
         if col == "FTD Count":
             display[col] = result[col].apply(lambda v: f"{v:,.0f}")
-        elif col == arpu_label:
+        elif col in na_labels:
             display[col] = result[col].apply(
                 lambda v: "n/a" if pd.isna(v) else format_currency(v)
             )
@@ -3114,7 +3161,15 @@ def render_ranking_tab(tab, group_col, label):
                 "This can reorder the table - a partner heavy in high-stake accounts "
                 "carries a larger share of that pool than one that isn't."
             )
-        result, profit_label, arpu_label = build_ranking_table(
+        st.caption(
+            "Estimated CPA is that group's Actual_Fixed_Fee plus 20% VAT, ÷ its FTD "
+            "Count - the average VAT-inclusive acquisition fee per player acquired, "
+            "from the CPA By Cohort figures. It's the fixed_per_player component and "
+            "its VAT only, not the whole of Affiliate Costs (no Rev Share or Fixed "
+            "Monthly Charge), and it's a LIFETIME average across every cohort, so it "
+            "isn't on the same cohort basis as the ARPU column beside it."
+        )
+        result, profit_label, arpu_label, cpa_label = build_ranking_table(
             filtered, group_col, include_affiliate_costs, include_fixed_costs, excluded_ftd_months
         )
         if group_col == "Partner ID" and partner_names:
@@ -3125,7 +3180,7 @@ def render_ranking_tab(tab, group_col, label):
                 index=lambda pid: partner_display_name(pid, partner_names)
             )
             result.index.name = "Partner"
-        display = format_ranking_table(result, profit_label, arpu_label)
+        display = format_ranking_table(result, profit_label, arpu_label, cpa_label)
         st.dataframe(display, use_container_width=True, height=min(35 * len(display) + 80, 700))
 
 
