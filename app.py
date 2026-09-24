@@ -43,6 +43,15 @@ in a few places - see commit history / conversation for why):
     same way (exactly one row per account, picked by lowest Commission
     ID). Since it's genuinely row-level once allocated, it's correctly
     included in the Partner/Campaign/Commission ranking tables too.
+  - "Paid Social Costs" is the view's Affiliate_Daily column: £450 per
+    day from 15 Sep 2026 for Campaign IDs 2134/2135, accrued per FTD
+    Month and split equally across that month's accounts on either
+    campaign, written onto each account's own FTD-month row only (see
+    rebuild_affilka_roi_dash.sql). It sits inside Total Affiliate Costs
+    alongside Fixed Monthly Charge, carries the same 20% VAT, and is
+    treated the same way everywhere Affiliate Costs appear - cohort
+    table, cumulative charts, ranking tabs, windowed LTV/payback (as an
+    up-front acquisition cost) and the model export.
 
 Two sidebar toggles change what the bottom-line figures (Sum of
 Deductions, Profit, Player LTV) are made of, and both are threaded
@@ -283,7 +292,8 @@ def load_roi_dash_data():
     charts - see build_relative_month_series(). "First deposit date"
     (the view's first_deposit_processed_at) pins the start of each
     account's own 30/90-day window for the 1-Month and 3-Month LTV rows
-    - see build_windowed_ltv().
+    - see build_windowed_ltv(). "Affiliate_Daily" feeds the Paid Social
+    Costs row under Total Affiliate Costs.
 
     Extends the statement timeout to 45s for this specific query (well
     above whatever short default the pooled connection uses), since
@@ -315,7 +325,7 @@ def load_roi_dash_data():
                 "Data Provider Fees",
                 "Casino Provider Fee", "Live Casino Provider Fee", "Virtuals Provider Fee",
                 "Trading Adjustments", "Estimated Processing Fees", "Admin/Platform Fees",
-                "Actual_Fixed_Fee", "Actual_RS"
+                "Actual_Fixed_Fee", "Actual_RS", "Affiliate_Daily"
             FROM "{SOURCE_VIEW}"
             WHERE "FTD Month" IS NOT NULL
         '''
@@ -1029,7 +1039,8 @@ def row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs):
     row-level in the source view: the pools (duties, provider fees,
     admin fees, processing fees) are all apportioned to individual rows
     upstream, and Allocated Fixed Monthly Charge is apportioned by this
-    app before any of this runs.
+    app before any of this runs. Affiliate_Daily (Paid Social Costs) is
+    apportioned upstream in the view, onto FTD-month rows only.
     """
     def c(col):
         return df[col] if col in df.columns else 0.0
@@ -1046,6 +1057,7 @@ def row_level_profit(df, include_affiliate_costs_in_ltv, include_fixed_costs):
 
     affiliate_costs = (
         c("Actual_Fixed_Fee") + c("Actual_RS") + c("Allocated Fixed Monthly Charge")
+        + c("Affiliate_Daily")
     ) * 1.2  # the same 20% VAT the cohort table's VAT row applies
 
     deductions = taxes + other_fees
@@ -1157,8 +1169,9 @@ def row_weights_for_window(terms, window_days):
 def upfront_acquisition_costs(df):
     """
     The part of Affiliate Costs paid AT acquisition rather than earned
-    out over time: the CPA fee and the Fixed Monthly Charge, plus their
-    VAT. Both land only on an account's own FTD-month row.
+    out over time: the CPA fee, the Fixed Monthly Charge and Paid Social
+    Costs (Affiliate_Daily), plus their VAT. All three land only on an
+    account's own FTD-month row.
 
     Kept separate from the day-weighting because spreading them across
     the window would let the cost grow at the same rate as the revenue
@@ -1171,7 +1184,9 @@ def upfront_acquisition_costs(df):
     def c(col):
         return df[col] if col in df.columns else 0.0
 
-    return (c("Actual_Fixed_Fee") + c("Allocated Fixed Monthly Charge")) * 1.2
+    return (
+        c("Actual_Fixed_Fee") + c("Allocated Fixed Monthly Charge") + c("Affiliate_Daily")
+    ) * 1.2
 
 
 def fully_loaded_profit_terms(df, include_fixed_costs):
@@ -1192,17 +1207,18 @@ def before_cpa_profit_terms(df, include_fixed_costs):
     back, rather than by assembling the cost list a second time, so the
     two bases can only ever differ by exactly that one component.
 
-    Rev Share and the Fixed Monthly Charge ARE charged. They're paid on
-    top of whatever CPA gets agreed, so leaving them out would overstate
-    what there is to spend. Only the Fixed Monthly Charge is up-front;
-    Rev Share follows revenue and so accrues with the window.
+    Rev Share, the Fixed Monthly Charge and Paid Social Costs ARE
+    charged. They're paid on top of whatever CPA gets agreed, so leaving
+    them out would overstate what there is to spend. The Fixed Monthly
+    Charge and Paid Social Costs are up-front; Rev Share follows revenue
+    and so accrues with the window.
     """
     def c(col):
         return df[col] if col in df.columns else 0.0
 
     cpa_with_vat = c("Actual_Fixed_Fee") * 1.2
     profit = row_level_profit(df, True, include_fixed_costs) + cpa_with_vat
-    return profit, c("Allocated Fixed Monthly Charge") * 1.2
+    return profit, (c("Allocated Fixed Monthly Charge") + c("Affiliate_Daily")) * 1.2
 
 
 def windowed_profit(profit, upfront, weights):
@@ -1253,8 +1269,8 @@ def build_windowed_ltv(df, months, window_days, include_fixed_costs, as_of=None)
     still be square by the end of the window. Charging the CPA fee here
     would be circular - the figure exists to decide what that fee should
     be - so it's the one cost held out. Everything else IS charged,
-    Rev Share and the Fixed Monthly Charge included, since those are
-    paid on top of whatever CPA gets agreed.
+    Rev Share, the Fixed Monthly Charge and Paid Social Costs included,
+    since those are paid on top of whatever CPA gets agreed.
 
     Two things to hold onto when quoting a number off this row:
       - VAT. The row is what's available to spend INCLUDING the VAT on
@@ -1455,6 +1471,9 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     separate Affiliate Costs subtraction step, since Sum of Deductions
     already accounts for it conditionally.
 
+    Total Affiliate Costs = fixed_per_player + Rev Share + Fixed Monthly
+    Charge + Paid Social Costs + VAT, where VAT is 20% of the other four.
+
     include_fixed_costs=False additionally drops Admin/Platform Fees
     from Total Other Fees & Adjustments, which is what carries it out
     of Sum of Deductions, Profit and Player LTV - that row is a flat
@@ -1548,8 +1567,14 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     fixed_per_player = col_sum("Actual_Fixed_Fee")
     rev_share = col_sum("Actual_RS")
     fixed_monthly_charge = col_sum("Allocated Fixed Monthly Charge")
-    vat = (fixed_per_player + rev_share + fixed_monthly_charge) * 0.2
-    total_affiliate_costs = fixed_per_player + rev_share + fixed_monthly_charge + vat
+    # Paid Social Costs - the view's Affiliate_Daily column (£450/day
+    # for Campaign IDs 2134/2135, on FTD-month rows only). Part of the
+    # VAT base and of Total Affiliate Costs, so it flows into Sum of
+    # Deductions / Profit / Player LTV whenever affiliate costs do.
+    paid_social_costs = col_sum("Affiliate_Daily")
+    affiliate_cost_base = fixed_per_player + rev_share + fixed_monthly_charge + paid_social_costs
+    vat = affiliate_cost_base * 0.2
+    total_affiliate_costs = affiliate_cost_base + vat
 
     # Sum of Deductions - now includes Total Affiliate Costs, but ONLY
     # when the sidebar toggle says to include it in Profit/LTV. Moved
@@ -1701,8 +1726,12 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     rows["  fixed_per_player (FTD Month)"] = fixed_per_player
     rows["  Rev Share (FTD Month)"] = rev_share
     rows["  Fixed Monthly Charge"] = fixed_monthly_charge
+    rows["  Paid Social Costs"] = paid_social_costs
     rows["  VAT"] = vat
-    sections.append(("Total Affiliate Costs", ["  fixed_per_player (FTD Month)", "  Rev Share (FTD Month)", "  Fixed Monthly Charge", "  VAT"]))
+    sections.append(("Total Affiliate Costs", [
+        "  fixed_per_player (FTD Month)", "  Rev Share (FTD Month)",
+        "  Fixed Monthly Charge", "  Paid Social Costs", "  VAT",
+    ]))
 
     # ── Bottom line - always last ──
     rows[sum_of_deductions_label] = sum_of_deductions
@@ -1829,6 +1858,7 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv, include_fixe
         fpp=("Actual_Fixed_Fee", "sum"),
         rs=("Actual_RS", "sum"),
         fmc=("Allocated Fixed Monthly Charge", "sum"),
+        paid_social=("Affiliate_Daily", "sum"),
     ).reset_index()
 
     per_period["total_bonus"] = per_period["free_spins"] + per_period["free_bets"] + per_period["bog"] + per_period["lucky"]
@@ -1842,8 +1872,14 @@ def build_relative_month_series(df, include_affiliate_costs_in_ltv, include_fixe
     if include_fixed_costs:
         per_period["total_other_fees"] = per_period["total_other_fees"] + per_period["admin_fees"]
 
-    per_period["vat"] = (per_period["fpp"] + per_period["rs"] + per_period["fmc"]) * 0.2
-    per_period["affiliate_costs"] = per_period["fpp"] + per_period["rs"] + per_period["fmc"] + per_period["vat"]
+    # Same affiliate cost build-up as build_cohort_table(), Paid Social
+    # Costs included, so the Cumulative Player LTV chart matches the
+    # table above it.
+    affiliate_cost_base = (
+        per_period["fpp"] + per_period["rs"] + per_period["fmc"] + per_period["paid_social"]
+    )
+    per_period["vat"] = affiliate_cost_base * 0.2
+    per_period["affiliate_costs"] = affiliate_cost_base + per_period["vat"]
 
     if include_affiliate_costs_in_ltv:
         per_period["sum_of_deductions"] = per_period["total_taxes"] + per_period["total_other_fees"] + per_period["affiliate_costs"]
@@ -2303,6 +2339,7 @@ MODEL_EXPORT_SUM_COLUMNS = [
     "Casino Provider Fee", "Live Casino Provider Fee", "Virtuals Provider Fee",
     "Trading Adjustments", "Estimated Processing Fees", "Admin/Platform Fees",
     "Actual_Fixed_Fee", "Actual_RS", "Allocated Fixed Monthly Charge",
+    "Affiliate_Daily",
 ]
 
 
@@ -2354,6 +2391,9 @@ def build_ltv_model_export(base_df, lifecycle_df, min_months_observed, max_accou
     a model can reproduce the dashboard's "exclude Fixed Costs" basis by
     subtracting it rather than inheriting whichever way that toggle
     happened to be set when the file was built.
+
+    affiliate_costs includes Paid Social Costs (Affiliate_Daily) and its
+    VAT, matching Total Affiliate Costs on the dashboard.
 
     FTD Count is NOT summed: it is 1 on every one of an account's
     commission rows (see allocate_fixed_monthly_charge()), so summing it
@@ -2429,8 +2469,11 @@ def build_ltv_model_export(base_df, lifecycle_df, min_months_observed, max_accou
     # see the docstring. Subtract it from total_other_fees to get the
     # dashboard's "exclude Fixed Costs" basis.
     out["admin_platform_fees"] = g("Admin/Platform Fees")
-    fixed_fee, rev_share, fmc = g("Actual_Fixed_Fee"), g("Actual_RS"), g("Allocated Fixed Monthly Charge")
-    out["affiliate_costs"] = fixed_fee + rev_share + fmc + (fixed_fee + rev_share + fmc) * 0.2
+    affiliate_base = (
+        g("Actual_Fixed_Fee") + g("Actual_RS")
+        + g("Allocated Fixed Monthly Charge") + g("Affiliate_Daily")
+    )
+    out["affiliate_costs"] = affiliate_base * 1.2
     out["profit_excl_affiliate"] = out["total_ggr"] - out["total_bonus"] - out["total_taxes_duties"] - out["total_other_fees"]
     out["profit_incl_affiliate"] = out["profit_excl_affiliate"] - out["affiliate_costs"]
 
@@ -2480,11 +2523,12 @@ def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv, inc
     slice this function was handed rather than recomputed against a
     differently-filtered frame - see build_ranking_table().
 
-    Affiliate Costs here includes "Allocated Fixed Monthly Charge" -
-    now that it's genuinely row-level (see allocate_fixed_monthly_charge()),
-    summing it by group_col is exactly as valid as summing Casino GGR by
-    group_col - matching Actual_Fixed_Fee and Actual_RS, which were
-    always genuinely row-level in the source view.
+    Affiliate Costs here includes "Allocated Fixed Monthly Charge" and
+    Paid Social Costs ("Affiliate_Daily") - both genuinely row-level
+    (see allocate_fixed_monthly_charge() and the view), so summing them
+    by group_col is exactly as valid as summing Casino GGR by group_col
+    - matching Actual_Fixed_Fee and Actual_RS, which were always
+    genuinely row-level in the source view.
     """
     grouped = df.groupby(group_col)
 
@@ -2522,8 +2566,10 @@ def summarise_group_economics(df, group_col, include_affiliate_costs_in_ltv, inc
     fixed_per_player = col_sum("Actual_Fixed_Fee")
     rev_share = col_sum("Actual_RS")
     fixed_monthly_charge = col_sum("Allocated Fixed Monthly Charge")
-    vat = (fixed_per_player + rev_share + fixed_monthly_charge) * 0.2
-    affiliate_costs = fixed_per_player + rev_share + fixed_monthly_charge + vat
+    paid_social_costs = col_sum("Affiliate_Daily")
+    affiliate_cost_base = fixed_per_player + rev_share + fixed_monthly_charge + paid_social_costs
+    vat = affiliate_cost_base * 0.2
+    affiliate_costs = affiliate_cost_base + vat
 
     if include_affiliate_costs_in_ltv:
         profit = total_ggr - total_bonus - sum_of_deductions - affiliate_costs
@@ -2590,9 +2636,10 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, include_f
     from the CPA By Cohort spreadsheet, per fixed_per_player's tooltip)
     plus 20% VAT, divided by its FTD Count - the average VAT-inclusive
     acquisition fee per player acquired. It covers ONLY that fee and its
-    VAT, not the whole of Affiliate Costs: Rev Share and Fixed Monthly
-    Charge (and their share of the VAT) are excluded, so it is a CPA
-    rate rather than a fully-loaded cost of acquisition.
+    VAT, not the whole of Affiliate Costs: Rev Share, Fixed Monthly
+    Charge and Paid Social Costs (and their share of the VAT) are
+    excluded, so it is a CPA rate rather than a fully-loaded cost of
+    acquisition.
 
     Returns (result, profit_label, arpu_label, cpa_label).
     """
@@ -2638,8 +2685,9 @@ def build_ranking_table(df, group_col, include_affiliate_costs_in_ltv, include_f
     #
     # The 20% is the same rate the cohort table's VAT row applies, just
     # to the fixed-fee component alone rather than to fixed fee + Rev
-    # Share + Fixed Monthly Charge together - so this figure is a strict
-    # subset of the VAT in Affiliate Costs, never additional to it.
+    # Share + Fixed Monthly Charge + Paid Social Costs together - so this
+    # figure is a strict subset of the VAT in Affiliate Costs, never
+    # additional to it.
     #
     # Deliberately on the LIFETIME slice, like every other column here
     # except ARPU. That means it is NOT directly comparable with the
@@ -3010,7 +3058,7 @@ ROW_EXPLANATIONS = {
         "sidebar toggle - untick it and this row is dropped from the total above, and "
         "therefore from Sum of Deductions, Profit and Player LTV."
     ),
-    "Total Affiliate Costs": "fixed_per_player + Rev Share + Fixed Monthly Charge + VAT.",
+    "Total Affiliate Costs": "fixed_per_player + Rev Share + Fixed Monthly Charge + Paid Social Costs + VAT.",
     "  fixed_per_player (FTD Month)": (
         "Source: CPA By Cohort spreadsheet\n\n"
         "For each (Partner ID, FTD Month) cohort with real cost data:\n"
@@ -3036,7 +3084,16 @@ ROW_EXPLANATIONS = {
         "costs toggle, not the Fixed Costs one - despite the name, it's an affiliate "
         "acquisition charge rather than a platform fixed cost."
     ),
-    "  VAT": "20% × (fixed_per_player + Rev Share + Fixed Monthly Charge).",
+    "  Paid Social Costs": (
+        "Source: Affilka ROI Dash (Affiliate_Daily)\n\n"
+        "£450 per day from 15 Sep 2026 for Campaign IDs 2134 and 2135, accrued per "
+        "FTD Month and split equally across that month's accounts on either "
+        "campaign. Written onto each account's own FTD-month row only, so it's an "
+        "acquisition cost like Fixed Monthly Charge. The current month's figure "
+        "grows by £450 each day the view is rebuilt.\n\n"
+        "Governed by the Affiliate Costs toggle, like the rest of Total Affiliate Costs."
+    ),
+    "  VAT": "20% × (fixed_per_player + Rev Share + Fixed Monthly Charge + Paid Social Costs).",
     # Keyed on the base label - the "(incl./excl. ...)" qualifier that
     # the real row carries varies with both sidebar toggles, so
     # row_explanation() strips it before looking up here.
@@ -3061,10 +3118,10 @@ ROW_EXPLANATIONS = {
         "the cohort. Paying the average only breaks even if the traffic keeps the same "
         "mix; a partner sending thinner players than the blend won't pay back at that "
         "price.\n\n"
-        "Rev Share and Fixed Monthly Charge ARE charged, since they're paid on top of "
-        "whatever CPA is agreed. This row therefore ignores the 'Include Affiliate "
-        "Costs' toggle - that's all-or-nothing over the whole bundle and would drag "
-        "the CPA fee back in. 'Include Fixed Costs' does still apply.\n\n"
+        "Rev Share, Fixed Monthly Charge and Paid Social Costs ARE charged, since "
+        "they're paid on top of whatever CPA is agreed. This row therefore ignores the "
+        "'Include Affiliate Costs' toggle - that's all-or-nothing over the whole bundle "
+        "and would drag the CPA fee back in. 'Include Fixed Costs' does still apply.\n\n"
         "The window starts at that account's own First deposit date. The view has no "
         "daily grain, so this is day-WEIGHTED rather than a true daily cut: each month "
         "counts at (days of the window falling in it) ÷ (days the account was live in "
@@ -3089,9 +3146,10 @@ ROW_EXPLANATIONS = {
         "subtracted here, since a payback period against a figure that never charged "
         "the acquisition cost has nothing to pay back. The 'Include Fixed Costs' "
         "toggle DOES apply, and turning it on lengthens payback.\n\n"
-        "The CPA fee and Fixed Monthly Charge (with VAT) are charged IN FULL from day "
-        "one, since that's when they're paid - only revenue and the costs that follow "
-        "revenue, Rev Share included, accrue across the window.\n\n"
+        "The CPA fee, Fixed Monthly Charge and Paid Social Costs (with VAT) are "
+        "charged IN FULL from day one, since that's when they're paid - only revenue "
+        "and the costs that follow revenue, Rev Share included, accrue across the "
+        "window.\n\n"
         "Inherits the day-weighting caveat from the LTV rows above, and it bites "
         "harder here: revenue is assumed to spread evenly across an account's live "
         "days, when in reality the first days after a deposit are the busiest. A "
@@ -3290,7 +3348,7 @@ include_affiliate_costs = st.sidebar.checkbox(
         "Off by default: Profit and Player LTV show core unit economics "
         "(revenue minus bonuses and deductions) before affiliate acquisition "
         "cost. Turn on to see the fully-loaded figure after Affiliate Costs "
-        "as well."
+        "(including Paid Social Costs) as well."
     ),
 )
 
@@ -3716,9 +3774,9 @@ def render_ranking_tab(tab, group_col, label):
             f"({excluded_display}), so groups aren't penalised for cohorts too "
             "young to have earned out yet. Every other column is a lifetime total "
             "across ALL cohorts, so ARPU won't equal this table's own Profit ÷ FTD "
-            "Count. Affiliate Costs includes Fixed Monthly Charge, split equally "
+            "Count. Affiliate Costs includes Fixed Monthly Charge (split equally "
             "across each FTD Month's new signups and attributed to their own "
-            "acquisition month."
+            "acquisition month) and Paid Social Costs (Campaign IDs 2134/2135)."
         )
         if not include_fixed_costs:
             st.caption(
@@ -3731,9 +3789,10 @@ def render_ranking_tab(tab, group_col, label):
             "Estimated CPA is that group's Actual_Fixed_Fee plus 20% VAT, ÷ its FTD "
             "Count - the average VAT-inclusive acquisition fee per player acquired, "
             "from the CPA By Cohort figures. It's the fixed_per_player component and "
-            "its VAT only, not the whole of Affiliate Costs (no Rev Share or Fixed "
-            "Monthly Charge), and it's a LIFETIME average across every cohort, so it "
-            "isn't on the same cohort basis as the ARPU column beside it."
+            "its VAT only, not the whole of Affiliate Costs (no Rev Share, Fixed "
+            "Monthly Charge or Paid Social Costs), and it's a LIFETIME average across "
+            "every cohort, so it isn't on the same cohort basis as the ARPU column "
+            "beside it."
         )
         result, profit_label, arpu_label, cpa_label = build_ranking_table(
             filtered, group_col, include_affiliate_costs, include_fixed_costs, excluded_ftd_months
