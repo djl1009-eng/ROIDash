@@ -78,6 +78,13 @@ come, scaled by the cohort's GGR quality index. See
 build_projected_ltv() and benchmark_development() for the method and
 why it's additive rather than classic multiplicative chain-ladder.
 
+The "Retention Forecast" tab fits a survival model to each account's
+deposit lifetime (FTD to last deposit): the observed Kaplan-Meier curve
+where the data is dense, a left-truncated Weibull tail beyond it, and a
+projection of not-yet-lapsed accounts for the next 12 months. See
+build_deposit_lifetimes() first - its censoring rule is the part that's
+easy to get wrong.
+
 The "30 Days % of Players Still Depositing" chart at the bottom of the
 FTD Cohort View is fed by a SEPARATE query (see
 load_deposit_lifecycle_data()) joining each account's FTD timestamp to
@@ -97,6 +104,7 @@ for the exact keys/format):
 
 import hashlib
 
+import numpy as np
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -1739,6 +1747,336 @@ def build_projected_ltv(df, benchmark_df, months, include_affiliate_costs_in_ltv
         )
     return series, note
 
+
+
+# ── RETENTION FORECAST (deposit-lifetime survival model) ─────────────
+#
+# Each account's DEPOSIT LIFETIME is the span from its first deposit to
+# its last one: 1 day if it only ever deposited on its FTD day. That's
+# the same definition the 30-day "% Still Depositing" chart uses, so the
+# two can be read together - this one just runs much further out and
+# fits a model to the part that hasn't happened yet.
+
+# An account counts as LAPSED (lifetime ended) once its last deposit is
+# more than this many days old. Younger than that, its lifetime is still
+# running and it's treated as CENSORED at its last deposit: it lasted at
+# least that long, and how much longer is unknown. The sidebar control
+# in the tab overrides this default.
+SURVIVAL_DEFAULT_INACTIVITY_DAYS = 60
+
+# The Weibull is fitted only to lifetimes past this day, as a
+# left-truncated fit. The first month - and above all the mass of
+# one-deposit accounts on day 1 - has a completely different shape from
+# the tail, and fitting one curve through both would bend the tail to
+# accommodate day 1. Only the tail needs a model; the first month is
+# observed for nearly every account.
+SURVIVAL_TAIL_FIT_FROM_DAY = 30
+
+# The observed (Kaplan-Meier) curve is used only while at least this
+# many accounts are still at risk. Past that, one lapse moves the curve
+# visibly, so the model takes over - rescaled to meet the observed curve
+# exactly at the join, so there's no step.
+SURVIVAL_MIN_AT_RISK = 50
+
+# Below this many lapses past SURVIVAL_TAIL_FIT_FROM_DAY there isn't
+# enough to fit a tail, and nothing is extrapolated.
+SURVIVAL_MIN_TAIL_EVENTS = 30
+
+SURVIVAL_CURVE_MONTHS = 24
+SURVIVAL_PROJECTION_MONTHS = 12
+DAYS_PER_MONTH = 30.4375
+
+
+def build_deposit_lifetimes(lifecycle_df, inactivity_days, as_of=None):
+    """
+    One row per account from load_deposit_lifecycle_data():
+    ftd_date, lifetime_days, lapsed, fit_duration, cohort (MM/YY).
+    Returns (frame, n_dropped) where n_dropped is accounts with no last
+    deposit, which can't be placed and are left out - the same rule and
+    the same caveat as the 30-day chart.
+
+    fit_duration is what the survival fit uses, and it is NOT the same as
+    lifetime_days for accounts still running. A lapse only becomes
+    visible inactivity_days after it happens, so lapses are only
+    detectable up to (as_of - inactivity_days). A running account is
+    therefore censored at THAT point, not at its own last deposit.
+    Censoring it at its last deposit instead looks natural but is
+    biased: every account that has genuinely stopped within the last
+    inactivity_days would be censored at exactly the moment it stopped,
+    so its lapse would never be counted, and the curve would read
+    systematically high. (Confirmed on synthetic data with a known
+    answer - the naive version overstated 3-month survival by ~7
+    points.)
+
+    A running account younger than inactivity_days has no detectable
+    window at all, so its fit_duration is NaN and it's left out of the
+    FIT - it still counts in the projection, where it's what's running
+    now that matters.
+
+    A last deposit dated before the FTD is clamped to the FTD (a one-day
+    lifetime) rather than dropped, again matching the 30-day chart.
+    """
+    columns = ["ftd_date", "lifetime_days", "lapsed", "fit_duration", "cohort"]
+    if lifecycle_df is None or lifecycle_df.empty:
+        return pd.DataFrame(columns=columns), 0
+
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+
+    d = lifecycle_df.dropna(subset=["ftd_at"]).copy()
+    d["ftd_date"] = to_local_naive_date(d["ftd_at"])
+    d["last_date"] = to_local_naive_date(d["last_deposit_at"])
+    d = d.dropna(subset=["ftd_date"])
+    n_dropped = int(d["last_date"].isna().sum())
+    d = d.dropna(subset=["last_date"])
+    d = d[d["ftd_date"] <= as_of_ts]
+    if d.empty:
+        return pd.DataFrame(columns=columns), n_dropped
+
+    d.loc[d["last_date"] < d["ftd_date"], "last_date"] = d["ftd_date"]
+    d["lifetime_days"] = (d["last_date"] - d["ftd_date"]).dt.days + 1
+    d["lapsed"] = (as_of_ts - d["last_date"]).dt.days > inactivity_days
+    detectable_to = as_of_ts - pd.Timedelta(days=inactivity_days)
+    censor_at = ((detectable_to - d["ftd_date"]).dt.days + 1).astype(float)
+    d["fit_duration"] = d["lifetime_days"].astype(float).where(
+        d["lapsed"], censor_at.where(censor_at >= 1)
+    )
+    d["cohort"] = d["ftd_date"].dt.strftime("%m/%y")
+    return d[columns].reset_index(drop=True), n_dropped
+
+
+def kaplan_meier(durations, events):
+    """
+    Kaplan-Meier survival estimate. Returns (times, survival, at_risk) at
+    each distinct lapse time, where survival[i] is the share of accounts
+    whose deposit lifetime lasts BEYOND times[i].
+
+    The standard non-parametric estimator for right-censored data, and
+    the reason censoring is handled correctly at all: an account still
+    depositing leaves the risk set at its last deposit without counting
+    as a lapse, rather than being wrongly treated as lapsed (which would
+    drag every curve down) or dropped (which would bias it towards
+    whoever happened to lapse quickly).
+    """
+    t = np.asarray(durations, dtype=float)
+    e = np.asarray(events, dtype=bool)
+    if len(t) == 0 or not e.any():
+        return np.array([]), np.array([]), np.array([])
+    times, deaths = np.unique(t[e], return_counts=True)
+    sorted_t = np.sort(t)
+    at_risk = len(t) - np.searchsorted(sorted_t, times, side="left")
+    survival = np.cumprod(1.0 - deaths / at_risk)
+    return times, survival, at_risk
+
+
+def km_survival_at(times, survival, x):
+    """Evaluates a Kaplan-Meier step function at x (scalar or array)."""
+    x = np.asarray(x, dtype=float)
+    if len(times) == 0:
+        return np.ones_like(x)
+    idx = np.searchsorted(times, x, side="right") - 1
+    return np.where(idx < 0, 1.0, survival[np.clip(idx, 0, None)])
+
+
+def fit_truncated_weibull(durations, events, t0=SURVIVAL_TAIL_FIT_FROM_DAY,
+                          min_events=SURVIVAL_MIN_TAIL_EVENTS):
+    """
+    Maximum-likelihood Weibull fit to lifetimes beyond t0, with right
+    censoring and left truncation at t0. Returns
+    {"shape", "scale", "n", "events"} or None if there are fewer than
+    min_events lapses to fit on.
+
+    Left truncation means the fit only asks "given an account lasted past
+    t0, how does the rest of its lifetime run?" - the right question for
+    a tail model, and it leaves the first month to the observed curve.
+
+    No scipy needed: for a fixed shape k, the scale has a closed form
+    (lambda^k = sum(t^k - t0^k) / lapses), so the likelihood reduces to
+    one dimension in k, searched on a log grid and then refined by golden
+    section. Shape below 1 means the lapse rate FALLS with age - the
+    usual pattern in a gaming book, since the accounts left after a few
+    months are the committed ones - and above 1 means it rises.
+    """
+    t = np.asarray(durations, dtype=float)
+    e = np.asarray(events, dtype=bool)
+    keep = t > t0
+    t, e = t[keep], e[keep]
+    n_events = int(e.sum())
+    if n_events < min_events:
+        return None
+
+    sum_log_t_events = float(np.log(t[e]).sum())
+
+    def profile_loglik(k):
+        a = float(np.sum(t ** k - t0 ** k))
+        if a <= 0:
+            return -np.inf
+        return (n_events * np.log(k) - n_events * np.log(a / n_events)
+                + (k - 1) * sum_log_t_events - n_events)
+
+    grid = np.exp(np.linspace(np.log(0.05), np.log(5.0), 120))
+    values = np.array([profile_loglik(k) for k in grid])
+    best = int(np.argmax(values))
+    lo = grid[max(best - 1, 0)]
+    hi = grid[min(best + 1, len(grid) - 1)]
+
+    golden = (np.sqrt(5) - 1) / 2
+    for _ in range(60):
+        c = hi - golden * (hi - lo)
+        d = lo + golden * (hi - lo)
+        if profile_loglik(c) > profile_loglik(d):
+            hi = d
+        else:
+            lo = c
+    shape = (lo + hi) / 2
+    scale = (float(np.sum(t ** shape - t0 ** shape)) / n_events) ** (1 / shape)
+    return {"shape": float(shape), "scale": float(scale), "n": int(len(t)), "events": n_events}
+
+
+def build_survival_function(lifetimes, min_at_risk=SURVIVAL_MIN_AT_RISK):
+    """
+    The survival curve the forecast runs on: the OBSERVED Kaplan-Meier
+    curve while at least min_at_risk accounts remain at risk, then the
+    fitted Weibull tail, rescaled to meet the observed curve exactly at
+    that join. Returns (S, info), where S(days) -> share of accounts
+    whose deposit lifetime extends beyond `days`.
+
+    Observed data is preferred wherever it's dense enough, because it
+    needs no assumption at all; the model is only used where the data
+    runs out. The rescaling uses the ratio Sw(t) / Sw(join), so the tail
+    carries the observed level forward and the Weibull supplies only the
+    RATE at which it keeps falling.
+
+    With no fitted tail (too few lapses past day
+    SURVIVAL_TAIL_FIT_FROM_DAY), S is NaN beyond the join: nothing is
+    extrapolated rather than something being made up.
+    """
+    fit = lifetimes.dropna(subset=["fit_duration"])
+    durations = fit["fit_duration"].to_numpy(dtype=float)
+    events = fit["lapsed"].to_numpy(dtype=bool)
+    times, survival, at_risk = kaplan_meier(durations, events)
+    weibull = fit_truncated_weibull(durations, events)
+
+    dense = at_risk >= min_at_risk
+    join_day = float(times[dense][-1]) if dense.any() else (float(times[0]) if len(times) else 1.0)
+    s_join = float(km_survival_at(times, survival, join_day))
+
+    def S(days):
+        x = np.asarray(days, dtype=float)
+        observed = km_survival_at(times, survival, x)
+        beyond = x > join_day
+        if weibull is None:
+            return np.where(beyond, np.nan, observed)
+        k, lam = weibull["shape"], weibull["scale"]
+        tail = s_join * np.exp(-((x / lam) ** k - (join_day / lam) ** k))
+        return np.where(beyond, tail, observed)
+
+    info = {
+        "weibull": weibull,
+        "join_day": join_day,
+        "km_times": times,
+        "km_survival": survival,
+        "n_accounts": int(len(durations)),
+        "n_lapsed": int(events.sum()),
+    }
+    return S, info
+
+
+def survival_curve_by_month(S, info, months=SURVIVAL_CURVE_MONTHS):
+    """
+    Wide frame for the chart: index Relative Month (1..months), one
+    column for the observed Kaplan-Meier curve (NaN once it stops being
+    dense enough to trust) and one for the curve the forecast actually
+    uses. Each point is the % of accounts still depositing at the END of
+    that relative month, on a 0-100 scale.
+    """
+    month_index = np.arange(1, months + 1)
+    days = month_index * DAYS_PER_MONTH
+    observed = km_survival_at(info["km_times"], info["km_survival"], days)
+    observed = np.where(days <= info["join_day"], observed, np.nan)
+    frame = pd.DataFrame({
+        "Relative Month": month_index,
+        "Observed": 100 * observed,
+        "Forecast curve": 100 * S(days),
+    }).set_index("Relative Month")
+    return frame
+
+
+def median_lifetime_days(S, max_days=SURVIVAL_CURVE_MONTHS * DAYS_PER_MONTH * 2):
+    """The day the curve crosses 50%, or None if it doesn't within max_days."""
+    grid = np.arange(1, int(max_days) + 1)
+    values = S(grid)
+    below = np.where(values <= 0.5)[0]
+    return int(grid[below[0]]) if len(below) else None
+
+
+def project_unlapsed_accounts(lifetimes, S, months_ahead=SURVIVAL_PROJECTION_MONTHS,
+                              planned_ftds_per_month=0, as_of=None):
+    """
+    For each of the next `months_ahead` calendar months, the expected
+    number of accounts whose deposit lifetime still reaches the START of
+    that month - i.e. accounts that haven't lapsed yet and will deposit
+    at least once more on or after that date.
+
+    NOTE THE DEFINITION: this is accounts NOT YET LAPSED, not accounts
+    depositing IN that month. An account still in its lifetime may skip
+    a month and deposit the month after. So this is an upper bound on a
+    month's depositors, and the gap between the two is the inactivity
+    the survival model can't see, since it only knows each account's
+    LAST deposit.
+
+    Existing book: each still-running account is weighted by its
+    CONDITIONAL survival, S(t_month) / S(t_now) - the chance it lasts
+    to that month GIVEN it has lasted to its last deposit so far.
+    Lapsed accounts contribute nothing. Reactivations aren't modelled,
+    so a winback campaign's effect would show up as the actuals beating
+    this line.
+
+    New FTDs: planned_ftds_per_month, each month's intake assumed to
+    land mid-month, counted in full in its own month and on the
+    unconditional curve S(t) afterwards. Leave at 0 for the existing
+    book only.
+
+    Returns a frame indexed by calendar month (MM/YY) with "Existing
+    book", "New FTDs" and "Total" columns, or an empty frame if the curve
+    doesn't reach far enough to project.
+    """
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+    first_month = as_of_ts.to_period("M") + 1
+
+    running = lifetimes[~lifetimes["lapsed"]]
+    ftd_dates = pd.to_datetime(running["ftd_date"])
+    s_now = S(running["lifetime_days"].to_numpy(dtype=float))
+
+    rows = []
+    for j in range(months_ahead):
+        period = first_month + j
+        month_start = period.start_time
+        t_month = ((month_start - ftd_dates).dt.days + 1).to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            conditional = np.clip(S(t_month) / s_now, 0.0, 1.0)
+        if np.isnan(conditional).all() and len(conditional):
+            break
+        existing = float(np.nansum(conditional))
+
+        new = 0.0
+        if planned_ftds_per_month:
+            for i in range(j + 1):
+                if i == j:
+                    new += planned_ftds_per_month
+                else:
+                    intake_mid = (first_month + i).start_time + pd.Timedelta(days=14)
+                    t_new = (month_start - intake_mid).days + 1
+                    s_new = float(S(t_new))
+                    new += planned_ftds_per_month * (0.0 if np.isnan(s_new) else s_new)
+
+        rows.append({
+            "Month": period.strftime("%m/%y"),
+            "Existing book": existing,
+            "New FTDs": new,
+            "Total": existing + new,
+        })
+
+    return pd.DataFrame(rows).set_index("Month") if rows else pd.DataFrame()
 
 
 def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0,
@@ -3789,8 +4127,9 @@ if filtered.empty:
 
 # ── TABS ─────────────────────────────────────────────────────────────
 
-tab_cohort, tab_partner, tab_campaign, tab_commission, tab_export = st.tabs([
-    "FTD Cohort View", "By Partner", "By Campaign ID", "By Commission ID", "Model Export",
+tab_cohort, tab_partner, tab_campaign, tab_commission, tab_retention, tab_export = st.tabs([
+    "FTD Cohort View", "By Partner", "By Campaign ID", "By Commission ID",
+    "Retention Forecast", "Model Export",
 ])
 
 with tab_cohort:
@@ -4140,6 +4479,186 @@ def render_ranking_tab(tab, group_col, label):
             result.index.name = "Partner"
         display = format_ranking_table(result, profit_label, arpu_label, cpa_label)
         st.dataframe(display, use_container_width=True, height=min(35 * len(display) + 80, 700))
+
+
+with tab_retention:
+    st.subheader("Retention forecast")
+    st.caption(
+        "Each account's deposit lifetime runs from its first deposit to its last. "
+        "The curve below is the share of accounts whose lifetime is still running at "
+        "the end of each relative month - observed where there's enough data, and a "
+        "fitted Weibull tail beyond that. It respects every sidebar filter."
+    )
+
+    ret_col1, ret_col2 = st.columns(2)
+    inactivity_days = ret_col1.number_input(
+        "Days without a deposit before an account counts as lapsed",
+        min_value=14, max_value=365, value=SURVIVAL_DEFAULT_INACTIVITY_DAYS, step=1,
+        help=(
+            "The one judgement call in this model. Shorter treats more accounts as "
+            "lapsed sooner, so the curve falls faster; longer leaves more accounts "
+            "'still running' but can only detect lapses up to that many days ago, so "
+            "the newest cohorts drop out of the fit. Worth flexing between 30, 60 and "
+            "90 to see how much the forecast depends on it."
+        ),
+    )
+    planned_ftds = ret_col2.number_input(
+        "Planned new FTDs per month (0 = existing book only)",
+        min_value=0, value=0, step=50,
+        help=(
+            "Adds a planned monthly intake to the projection, each month's FTDs "
+            "following the same survival curve from their own first deposit."
+        ),
+    )
+
+    retention_lifecycle = load_deposit_lifecycle_data()
+    if retention_lifecycle.empty:
+        st.info("Deposit lifecycle data is unavailable, so no retention forecast can be built.")
+    else:
+        retention_ids = set(filtered["Original player ID"].dropna().astype(str))
+        retention_scoped = retention_lifecycle[
+            retention_lifecycle["player_id"].astype(str).isin(retention_ids)
+        ]
+        lifetimes, n_no_last_deposit = build_deposit_lifetimes(
+            retention_scoped, int(inactivity_days)
+        )
+        # 02/26 is left out of the CURVE, as it is from the projected LTV
+        # benchmark, but its running accounts are still projected.
+        fit_lifetimes = lifetimes[
+            ~lifetimes["cohort"].isin(PROJECTION_EXCLUDED_COHORTS)
+            & lifetimes["fit_duration"].notna()
+        ]
+
+        if fit_lifetimes.empty or not fit_lifetimes["lapsed"].any():
+            st.info(
+                "Not enough accounts with a detectable lapse to fit a curve for the "
+                "current filters. Try widening the filters or shortening the lapse "
+                "threshold."
+            )
+        else:
+            S, survival_info = build_survival_function(fit_lifetimes)
+            weibull = survival_info["weibull"]
+            median_days = median_lifetime_days(S)
+
+            met1, met2, met3, met4 = st.columns(4)
+            met1.metric("Accounts in fit", f"{survival_info['n_accounts']:,}")
+            met2.metric("Lapsed", f"{survival_info['n_lapsed']:,}")
+            met3.metric(
+                "Median deposit lifetime",
+                f"{median_days:,} days" if median_days else "Beyond range",
+                help=(
+                    "The day half the accounts have made their last deposit. 1 day "
+                    "means more than half never deposited again after their FTD day."
+                ),
+            )
+            met4.metric(
+                "Weibull tail shape",
+                f"{weibull['shape']:.2f}" if weibull else "n/a",
+                help=(
+                    "Below 1: the lapse rate falls as accounts age - the survivors of "
+                    "the first few months are the committed ones. Above 1: it rises. "
+                    f"Fitted to lifetimes past day {SURVIVAL_TAIL_FIT_FROM_DAY} only. "
+                    "n/a means too few lapses to fit a tail, so nothing is extrapolated."
+                ),
+            )
+
+            curve = survival_curve_by_month(S, survival_info)
+            curve_long = (
+                curve.reset_index()
+                .melt(id_vars="Relative Month", var_name="Series", value_name="% still depositing")
+                .dropna()
+            )
+            join_month = survival_info["join_day"] / DAYS_PER_MONTH
+            curve_chart = (
+                alt.Chart(curve_long)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X(
+                        "Relative Month:Q",
+                        scale=alt.Scale(domain=[1, SURVIVAL_CURVE_MONTHS], nice=False),
+                        axis=alt.Axis(tickMinStep=1, format="d"),
+                    ),
+                    y=alt.Y("% still depositing:Q", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color("Series:N", sort=["Forecast curve", "Observed"]),
+                    strokeDash=alt.StrokeDash("Series:N", sort=["Forecast curve", "Observed"]),
+                    tooltip=[
+                        "Series", "Relative Month",
+                        alt.Tooltip("% still depositing:Q", format=".1f"),
+                    ],
+                )
+            )
+            join_rule = (
+                alt.Chart(pd.DataFrame({"Relative Month": [join_month]}))
+                .mark_rule(strokeDash=[4, 4], opacity=0.6)
+                .encode(x="Relative Month:Q")
+            )
+            st.altair_chart(
+                (curve_chart + join_rule).properties(height=350), use_container_width=True
+            )
+            st.caption(
+                f"Observed curve used up to day {survival_info['join_day']:,.0f} "
+                f"(dashed line, the last point with {SURVIVAL_MIN_AT_RISK}+ accounts "
+                "still at risk). "
+                + (
+                    f"Beyond it, the Weibull tail (shape {weibull['shape']:.2f}, scale "
+                    f"{weibull['scale']:,.0f} days, fitted on {weibull['events']:,} lapses "
+                    "past day "
+                    f"{SURVIVAL_TAIL_FIT_FROM_DAY}) carries the observed level forward."
+                    if weibull else
+                    "Too few lapses to fit a tail, so the curve stops there."
+                )
+                + (
+                    f" {n_no_last_deposit:,} accounts with no recorded last deposit are "
+                    "excluded."
+                    if n_no_last_deposit else ""
+                )
+            )
+
+            st.divider()
+            st.subheader("Projected not-yet-lapsed accounts")
+            projection = project_unlapsed_accounts(
+                lifetimes, S, SURVIVAL_PROJECTION_MONTHS, int(planned_ftds)
+            )
+            if projection.empty:
+                st.info(
+                    "The curve doesn't reach far enough to project forward - no tail "
+                    "could be fitted for the current filters."
+                )
+            else:
+                bar_columns = ["Existing book"] + (["New FTDs"] if planned_ftds else [])
+                projection_long = (
+                    projection[bar_columns].reset_index()
+                    .melt(id_vars="Month", var_name="Source", value_name="Accounts")
+                )
+                projection_chart = (
+                    alt.Chart(projection_long)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("Month:N", sort=list(projection.index)),
+                        y=alt.Y("Accounts:Q", stack="zero"),
+                        color=alt.Color("Source:N", sort=bar_columns),
+                        tooltip=["Month", "Source", alt.Tooltip("Accounts:Q", format=",.0f")],
+                    )
+                    .properties(height=300)
+                )
+                st.altair_chart(projection_chart, use_container_width=True)
+                st.dataframe(
+                    projection[bar_columns + (["Total"] if planned_ftds else [])]
+                    .apply(lambda col: col.map(lambda v: f"{v:,.0f}")),
+                    use_container_width=True,
+                )
+                n_running = int((~lifetimes["lapsed"]).sum())
+                st.caption(
+                    f"Starts from the {n_running:,} accounts whose last deposit is within "
+                    f"{int(inactivity_days)} days. Each is weighted by its chance of "
+                    "lasting to the start of that month, given how long it has lasted "
+                    "so far. This counts accounts that have NOT YET LAPSED - each will "
+                    "deposit at least once more on or after that date - not accounts "
+                    "depositing IN that month, since an account can skip a month and "
+                    "come back. Read it as an upper bound on a month's depositors. "
+                    "Reactivations of lapsed accounts aren't modelled, so a winback "
+                    "campaign shows up as actuals beating this line."
+                )
 
 
 with tab_export:
