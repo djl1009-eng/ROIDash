@@ -71,6 +71,13 @@ different bases at once:
 The row labels carry the basis in force (see deduction_basis_labels()),
 so an exported screenshot can't be misread as the default one.
 
+Player LTV's detail rows include a "Projected 12-Month LTV" - each
+cohort's actual profit per player through its completed months plus
+the whole book's average per-player increments for the months still to
+come, scaled by the cohort's GGR quality index. See
+build_projected_ltv() and benchmark_development() for the method and
+why it's additive rather than classic multiplicative chain-ladder.
+
 The "30 Days % of Players Still Depositing" chart at the bottom of the
 FTD Cohort View is fed by a SEPARATE query (see
 load_deposit_lifecycle_data()) joining each account's FTD timestamp to
@@ -1451,8 +1458,291 @@ def build_payback_period(df, months, include_fixed_costs, as_of=None):
     return series
 
 
+# ── PROJECTED LTV (chain-ladder style development) ───────────────────
 
-def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0):
+# How far out the projection runs, in relative months (1 = FTD month).
+PROJECTION_HORIZON_MONTHS = 12
+
+# A relative month's benchmark increment is only trusted when at least
+# this many cohorts have a COMPLETE month at that age. Beyond that, the
+# curve is extrapolated (see PROJECTION_TAIL_FIT_MONTHS).
+PROJECTION_MIN_BENCHMARK_COHORTS = 3
+
+# How many of the last trusted relative months the tail decay rate is
+# fitted on. Relative month 1 is never used for the fit, since it
+# carries the up-front acquisition costs and isn't comparable to later
+# months.
+PROJECTION_TAIL_FIT_MONTHS = 3
+
+# Bounds on the cohort quality index (the cohort's GGR per player to
+# date relative to the benchmark's at the same age). Stops one freak
+# month scaling the whole projected tail by 10x or to nothing.
+PROJECTION_QUALITY_CLIP = (0.25, 4.0)
+
+# Cohorts left out of the BENCHMARK only - they still get their own
+# projection. 02/26 is the known bad month already excluded from LTV
+# analysis.
+PROJECTION_EXCLUDED_COHORTS = frozenset({"02/26"})
+
+PROJECTED_LTV_ROW_LABEL = f"  Projected {PROJECTION_HORIZON_MONTHS}-Month LTV"
+
+
+def cohort_development_triangle(df, include_affiliate_costs_in_ltv, include_fixed_costs, as_of=None):
+    """
+    The development triangle: profit and Total GGR per (FTD Month,
+    Relative Month), COMPLETE calendar months only.
+
+    Returns (profit, ggr, ftd_count, elapsed):
+      profit / ggr - DataFrames, index FTD Month, columns relative month
+        1..N. A cell is NaN where that cohort hasn't completed that month
+        yet, and 0.0 where the month is complete but had no activity -
+        those mean different things and the projection relies on telling
+        them apart.
+      ftd_count - FTD Count per cohort, summed exactly as the cohort
+        table sums it, so per-player figures here are on the same
+        denominator as Player LTV.
+      elapsed - complete relative months per cohort. Relative month k is
+        calendar month (FTD month + k - 1), and the current calendar
+        month is always partial, so a cohort has
+        cohort_months_elapsed() complete months: on 2 Oct, 08/26 has
+        two (Aug, Sep) and 10/26 has none.
+
+    Profit uses row_level_profit() on whatever basis the two sidebar
+    toggles say, so the projection sits on the same basis as the Player
+    LTV row it hangs under. Rows before the FTD (Relative Month < 1) are
+    excluded, as in the cumulative charts.
+    """
+    as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.today()
+
+    relative_month = pd.to_numeric(df["Relative Month"], errors="coerce").round()
+    d = df[relative_month >= 1].copy()
+    d["_k"] = relative_month[relative_month >= 1].astype(int)
+    d["_profit"] = row_level_profit(d, include_affiliate_costs_in_ltv, include_fixed_costs)
+    d["_ggr"] = d["Casino GGR"] + d["SB GGR"] + d["SB Correction"]
+
+    ftd_count = df.groupby("FTD Month")["FTD Count"].sum()
+    elapsed = pd.Series(
+        {m: cohort_months_elapsed(m, as_of_ts) for m in ftd_count.index}, dtype=float
+    )
+
+    d = d[d["_k"] <= d["FTD Month"].map(elapsed)]
+
+    max_k = int(max(elapsed.max() if len(elapsed) else 0, 1))
+    columns = range(1, max_k + 1)
+
+    def pivot(value_col):
+        table = (
+            d.pivot_table(index="FTD Month", columns="_k", values=value_col,
+                          aggfunc="sum", fill_value=0.0)
+            .reindex(index=ftd_count.index, columns=columns, fill_value=0.0)
+            .astype(float)
+        )
+        # Blank out months the cohort hasn't completed - fill_value above
+        # zeroed them, which would read as "complete but earned nothing".
+        for month, months_done in elapsed.items():
+            table.loc[month, [k for k in columns if k > months_done]] = float("nan")
+        return table
+
+    return pivot("_profit"), pivot("_ggr"), ftd_count, elapsed
+
+
+def benchmark_development(profit, ggr, ftd_count, elapsed, horizon=PROJECTION_HORIZON_MONTHS,
+                          excluded=PROJECTION_EXCLUDED_COHORTS,
+                          min_cohorts=PROJECTION_MIN_BENCHMARK_COHORTS,
+                          tail_fit_months=PROJECTION_TAIL_FIT_MONTHS):
+    """
+    Average incremental profit and GGR per player at each relative month,
+    from every cohort that has completed that month, FTD-weighted (sum of
+    profit ÷ sum of FTDs, not a mean of cohort ratios - so a 20-FTD
+    cohort can't move the curve as much as a 400-FTD one).
+
+    ADDITIVE, not the classic multiplicative chain-ladder. Classic
+    chain-ladder multiplies cumulative profit by age-to-age factors,
+    which breaks as soon as cumulative profit is negative or near zero -
+    and with affiliate costs charged up front, plenty of cohorts sit
+    below zero for their first months. A ratio of two negative numbers,
+    or of anything to something near zero, produces nonsense factors.
+    Working in per-player increments avoids that entirely; cohort
+    quality is brought back in separately via the GGR quality index in
+    build_projected_ltv(), where the ratios are of GGR (almost always
+    positive) rather than of profit.
+
+    Relative months are trusted only while at least min_cohorts cohorts
+    contribute. Beyond that, increments decay geometrically at the
+    average month-on-month ratio of the last tail_fit_months trusted
+    increments (relative month 1 excluded - it carries the up-front
+    costs), clipped to 0-100% so the tail can shrink but never grow.
+    If that can't be fitted (too few trusted months, or non-positive
+    increments), the tail is set to ZERO - deliberately conservative,
+    and flagged in the returned info.
+
+    Returns (increments, ggr_increments, info):
+      increments - {k: profit per player at relative month k} for
+        k = 1..horizon, trusted months plus the extrapolated tail
+      ggr_increments - {k: GGR per player}, trusted months only
+      info - reliable_through, tail_rate (None if not needed) and
+        tail_method, for the caption
+    """
+    eligible = [m for m in profit.index if m not in excluded and ftd_count.get(m, 0) > 0]
+
+    increments, ggr_increments, n_by_month = {}, {}, {}
+    for k in range(1, horizon + 1):
+        if k not in profit.columns:
+            break
+        contributors = [m for m in eligible if elapsed.get(m, -1) >= k]
+        if len(contributors) < min_cohorts:
+            break
+        ftds = ftd_count[contributors].sum()
+        increments[k] = float(profit.loc[contributors, k].sum() / ftds)
+        ggr_increments[k] = float(ggr.loc[contributors, k].sum() / ftds)
+        n_by_month[k] = len(contributors)
+
+    reliable_through = max(increments) if increments else 0
+    info = {
+        "reliable_through": reliable_through,
+        "min_cohorts_at_tail": n_by_month.get(reliable_through),
+        "tail_rate": None,
+        "tail_method": None,
+    }
+
+    if 0 < reliable_through < horizon:
+        fit_from = max(2, reliable_through - tail_fit_months + 1)
+        recent = [increments[k] for k in range(fit_from, reliable_through + 1)]
+        ratios = [b / a for a, b in zip(recent, recent[1:]) if a > 0 and b > 0]
+        if ratios:
+            # Geometric mean - the right average for a rate of decay.
+            rate = float(pd.Series(ratios).prod() ** (1 / len(ratios)))
+            rate = min(max(rate, 0.0), 1.0)
+            base = increments[reliable_through]
+            for k in range(reliable_through + 1, horizon + 1):
+                increments[k] = base * rate ** (k - reliable_through)
+            info["tail_rate"] = rate
+            info["tail_method"] = "decay"
+        else:
+            for k in range(reliable_through + 1, horizon + 1):
+                increments[k] = 0.0
+            info["tail_method"] = "zero"
+
+    return increments, ggr_increments, info
+
+
+def build_projected_ltv(df, benchmark_df, months, include_affiliate_costs_in_ltv,
+                        include_fixed_costs, horizon=PROJECTION_HORIZON_MONTHS, as_of=None):
+    """
+    Projected Player LTV at `horizon` relative months for each cohort:
+    its own ACTUAL profit per player through its complete months, plus
+    the benchmark's increments for every month still to come, scaled by
+    the cohort's quality index. Returns (series indexed by months, note).
+
+    Two frames, deliberately:
+      df - the sidebar-filtered frame. Supplies each cohort's actuals and
+        quality index, so a filtered partner is projected from its own
+        level.
+      benchmark_df - normally the FULL unfiltered frame. Supplies the
+        SHAPE of the curve. A single partner's own triangle is usually far
+        too thin to have a reliable shape of its own - a handful of
+        cohorts, each small - so it borrows the book's shape and keeps its
+        own level. The trade-off: a partner whose players genuinely decay
+        faster or slower than the book's will be projected on the book's
+        decay anyway. Pass the filtered frame as benchmark_df to use the
+        partner's own shape instead.
+
+    QUALITY INDEX = the cohort's GGR per player over its complete months
+    ÷ the benchmark's GGR per player over the same months, clipped to
+    PROJECTION_QUALITY_CLIP. A cohort running at 1.3x the book's GGR to
+    date has its projected future increments scaled by 1.3. Measured on
+    GGR rather than profit for the same reason the benchmark is additive
+    - see benchmark_development(). Without it, every cohort would get the
+    same future increments regardless of how it had performed so far.
+
+    A cohort already past `horizon` shows its ACTUAL profit through
+    relative month `horizon` - no projection involved. A cohort with no
+    complete month yet (the current month's) is blank: there's nothing
+    to measure its quality on.
+
+    Uses relative months 1+ only, so it can differ slightly from Player
+    LTV on a cohort with pre-FTD activity, which the lifetime row
+    includes.
+    """
+    empty = pd.Series(index=pd.Index(months, name="FTD Month"), dtype=float)
+    required = {"FTD Month", "Relative Month", "FTD Count"}
+    if df.empty or not required.issubset(df.columns):
+        return empty, None
+
+    profit, ggr, ftd_count, elapsed = cohort_development_triangle(
+        df, include_affiliate_costs_in_ltv, include_fixed_costs, as_of
+    )
+    b_profit, b_ggr, b_ftd, b_elapsed = cohort_development_triangle(
+        benchmark_df, include_affiliate_costs_in_ltv, include_fixed_costs, as_of
+    )
+    increments, ggr_increments, info = benchmark_development(
+        b_profit, b_ggr, b_ftd, b_elapsed, horizon
+    )
+    reliable_through = info["reliable_through"]
+
+    low, high = PROJECTION_QUALITY_CLIP
+    projected = {}
+    for month in months:
+        n_ftd = ftd_count.get(month, 0)
+        months_done = int(elapsed.get(month, 0)) if pd.notna(elapsed.get(month)) else 0
+        if month not in profit.index or n_ftd <= 0 or months_done < 1:
+            projected[month] = float("nan")
+            continue
+
+        actual_through = min(months_done, horizon)
+        actual = profit.loc[month, list(range(1, actual_through + 1))].sum() / n_ftd
+        if months_done >= horizon:
+            projected[month] = float(actual)
+            continue
+        if reliable_through == 0:
+            projected[month] = float("nan")
+            continue
+
+        index_months = list(range(1, min(months_done, reliable_through) + 1))
+        cohort_ggr = ggr.loc[month, index_months].sum() / n_ftd
+        bench_ggr = sum(ggr_increments[k] for k in index_months)
+        quality = min(max(cohort_ggr / bench_ggr, low), high) if bench_ggr > 0 else 1.0
+
+        future = sum(quality * increments[k] for k in range(months_done + 1, horizon + 1))
+        projected[month] = float(actual + future)
+
+    series = pd.Series(projected, dtype=float).reindex(months)
+    series.index.name = "FTD Month"
+
+    tail_span = (
+        f"month {horizon}" if reliable_through + 1 == horizon
+        else f"months {reliable_through + 1}-{horizon}"
+    )
+    if reliable_through == 0:
+        note = (
+            f"Projected {horizon}-Month LTV is unavailable: no relative month has "
+            f"{PROJECTION_MIN_BENCHMARK_COHORTS}+ complete cohorts to benchmark against."
+        )
+    elif reliable_through >= horizon:
+        note = (
+            f"Projected {horizon}-Month LTV uses the book's observed development "
+            f"through relative month {horizon}."
+        )
+    elif info["tail_method"] == "decay":
+        note = (
+            f"Projected {horizon}-Month LTV uses the book's observed development "
+            f"through relative month {reliable_through} "
+            f"({PROJECTION_MIN_BENCHMARK_COHORTS}+ complete cohorts each); "
+            f"{tail_span} EXTRAPOLATED at "
+            f"{info['tail_rate']:.0%} of the previous month's per-player profit."
+        )
+    else:
+        note = (
+            f"Projected {horizon}-Month LTV uses the book's observed development "
+            f"through relative month {reliable_through}; {tail_span} assumed to add "
+            "NOTHING, since no decay rate could be fitted - treat it as a floor."
+        )
+    return series, note
+
+
+
+def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0,
+                       benchmark_df=None):
     """
     Groups the (already-filtered) dataframe by FTD Month and computes
     every row of the cohort report, organised into clear labeled
@@ -1489,6 +1779,10 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
     with 1 FTD and negligible GGR right at the edge of the data) rather
     than a hardcoded exclusion of one specific month.
 
+    benchmark_df supplies the curve SHAPE for the Projected 12-Month LTV
+    row - normally the full unfiltered frame, see build_projected_ltv().
+    Defaults to df itself when not given.
+
     Returns (table, months, total_rows, sections, windowed_ltv_note):
       total_rows: set of row labels that are SUMS of other rows (Total
         GGR, Total Bonus, Total Taxes & Duties, Total Other Fees &
@@ -1500,10 +1794,11 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
         row - used to build the expand/collapse controls and to insert
         detail rows in the right position when a section is expanded.
         Player LTV's detail rows are the exception to "details sum to
-        the parent": 1-Month and 3-Month LTV are the same metric over
-        shorter windows, not components of the lifetime figure.
+        the parent": 1-Month, 3-Month and Projected 12-Month LTV are the
+        same metric over different windows, not components of the
+        lifetime figure.
       windowed_ltv_note: a caption to render under the table, or None -
-        see build_windowed_ltv().
+        see build_windowed_ltv() and build_projected_ltv().
     """
     all_months = sorted(df["FTD Month"].dropna().unique(), key=month_sort_key, reverse=True)
 
@@ -1763,6 +2058,18 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
         rows[label] = series
         windowed_ltv_rows.append(label)
 
+    # Projected LTV - unlike the two rows above, this is on the SAME
+    # cost basis as the Player LTV parent (both toggles apply), since
+    # it's a forecast of that figure rather than a CPA ceiling. Shape
+    # from benchmark_df (normally the full book), level from df - see
+    # build_projected_ltv().
+    projected_ltv, projection_note = build_projected_ltv(
+        df, benchmark_df if benchmark_df is not None else df, months,
+        include_affiliate_costs_in_ltv, include_fixed_costs,
+    )
+    rows[PROJECTED_LTV_ROW_LABEL] = projected_ltv
+    windowed_ltv_rows.append(PROJECTED_LTV_ROW_LABEL)
+
     # Same section, but a duration rather than a currency - it answers
     # "when does the acquisition cost come back" where the two rows
     # above answer "how much is back by day N". Deliberately blind to
@@ -1779,6 +2086,10 @@ def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, 
         "with no recorded first deposit date."
         if n_dropped else None
     )
+    if projection_note:
+        windowed_ltv_note = (
+            f"{windowed_ltv_note} {projection_note}" if windowed_ltv_note else projection_note
+        )
 
     table = pd.DataFrame(rows).T
     table = table[months]
@@ -3171,6 +3482,21 @@ ROW_EXPLANATIONS = {
         "Blank until the cohort's last-acquired account has had a full 90 days of "
         "completed data, so this fills in about two months later than the 1-Month row."
     ),
+    PROJECTED_LTV_ROW_LABEL: (
+        "This cohort's actual profit per player through its completed months, plus the "
+        "whole book's average profit per player for each month still to come, scaled by "
+        "this cohort's GGR per player to date relative to the book's at the same age.\n\n"
+        "Same cost basis as Player LTV above - follows both sidebar toggles, unlike the "
+        "1-Month and 3-Month rows. Cohorts past 12 months show their actual 12-month "
+        "figure. Relative months with fewer than "
+        f"{PROJECTION_MIN_BENCHMARK_COHORTS} completed cohorts are extrapolated - see the "
+        "caption under the table for which, and at what decay rate. 02/26 is left out "
+        "of the benchmark curve but still gets its own projection.\n\n"
+        "When the sidebar is filtered (e.g. to one partner), the curve SHAPE still comes "
+        "from the whole book and only the LEVEL comes from the filtered accounts, since "
+        "a single partner rarely has enough cohorts for a reliable shape of its own.\n\n"
+        "The current month is blank, since it has no completed month to measure."
+    ),
 }
 
 
@@ -3468,8 +3794,12 @@ tab_cohort, tab_partner, tab_campaign, tab_commission, tab_export = st.tabs([
 ])
 
 with tab_cohort:
+    # benchmark_df=df: the Projected 12-Month LTV row takes its curve
+    # SHAPE from the full, unfiltered book and only its level from
+    # `filtered` - see build_projected_ltv().
     table, months, total_rows, sections, windowed_ltv_note = build_cohort_table(
-        filtered, include_affiliate_costs, include_fixed_costs, min_ftd_count
+        filtered, include_affiliate_costs, include_fixed_costs, min_ftd_count,
+        benchmark_df=df,
     )
 
     # Map each detail row label back to its parent section, so a
@@ -3495,7 +3825,8 @@ with tab_cohort:
 
     # Only shown while the Player LTV section is open - otherwise it's a
     # caption about rows that aren't on screen.
-    if any(row in {"  1-Month LTV (before CPA)", "  3-Month LTV (before CPA)", PAYBACK_ROW_LABEL}
+    if any(row in {"  1-Month LTV (before CPA)", "  3-Month LTV (before CPA)",
+                   PROJECTED_LTV_ROW_LABEL, PAYBACK_ROW_LABEL}
            for row in visible_rows):
         st.caption(
             f"1-Month and 3-Month LTV (before CPA) are CPA ceilings: what the average "
@@ -3505,9 +3836,11 @@ with tab_cohort:
             "includes the VAT you'd pay on it - and it's a mean over a skewed "
             "distribution, so it only holds if a partner's traffic matches the blend. "
             "Both ignore the Affiliate Costs toggle, which is all-or-nothing and would "
-            "pull the CPA fee back in. Estimated Payback Period is the other side of "
-            "the same question - the day the CPA actually paid is covered - so it "
-            "always charges the full affiliate bundle. Hover a row label for the detail."
+            "pull the CPA fee back in. Projected 12-Month LTV is a forecast of Player "
+            "LTV itself, on the same basis as that row. Estimated Payback Period is the "
+            "other side of the CPA question - the day the CPA actually paid is covered "
+            "- so it always charges the full affiliate bundle. Hover a row label for "
+            "the detail."
         )
         if windowed_ltv_note:
             st.caption(windowed_ltv_note)
