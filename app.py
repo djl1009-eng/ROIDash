@@ -1983,21 +1983,30 @@ def build_survival_function(lifetimes, min_at_risk=SURVIVAL_MIN_AT_RISK):
 
 def survival_curve_by_month(S, info, months=SURVIVAL_CURVE_MONTHS):
     """
-    Wide frame for the chart: index Relative Month (1..months), one
+    Wide frame for the chart: index "Months since FTD" (1..months), one
     column for the observed Kaplan-Meier curve (NaN once it stops being
     dense enough to trust) and one for the curve the forecast actually
-    uses. Each point is the % of accounts still depositing at the END of
-    that relative month, on a 0-100 scale.
+    uses. Each point is the % of accounts still depositing m x 30.4 days
+    after their OWN first deposit, on a 0-100 scale - so point 1 is the
+    same thing as day 30 on the "30 Days % of Players Still Depositing"
+    chart.
+
+    Deliberately NOT called "Relative Month": everywhere else in this
+    app that means a CALENDAR month (1 = the FTD's own calendar month,
+    however late in it the FTD landed), which would make point 1 mean
+    anything from 1 to 31 days of history depending on the account.
+    Counting from each account's own FTD day keeps every account on the
+    same clock, which a survival curve needs.
     """
     month_index = np.arange(1, months + 1)
     days = month_index * DAYS_PER_MONTH
     observed = km_survival_at(info["km_times"], info["km_survival"], days)
     observed = np.where(days <= info["join_day"], observed, np.nan)
     frame = pd.DataFrame({
-        "Relative Month": month_index,
+        "Months since FTD": month_index,
         "Observed": 100 * observed,
         "Forecast curve": 100 * S(days),
-    }).set_index("Relative Month")
+    }).set_index("Months since FTD")
     return frame
 
 
@@ -4485,9 +4494,12 @@ with tab_retention:
     st.subheader("Retention forecast")
     st.caption(
         "Each account's deposit lifetime runs from its first deposit to its last. "
-        "The curve below is the share of accounts whose lifetime is still running at "
-        "the end of each relative month - observed where there's enough data, and a "
-        "fitted Weibull tail beyond that. It respects every sidebar filter."
+        "The curve below is the share of accounts whose lifetime is still running N "
+        "months after their OWN first deposit - observed where there's enough data, "
+        "and a fitted Weibull tail beyond that. Months here are 30.4-day blocks counted "
+        "from each account's FTD day, not calendar months, so month 1 lines up with "
+        "day 30 on the 30-day chart in the FTD Cohort View. It respects every sidebar "
+        "filter."
     )
 
     ret_col1, ret_col2 = st.columns(2)
@@ -4565,7 +4577,7 @@ with tab_retention:
             curve = survival_curve_by_month(S, survival_info)
             curve_long = (
                 curve.reset_index()
-                .melt(id_vars="Relative Month", var_name="Series", value_name="% still depositing")
+                .melt(id_vars="Months since FTD", var_name="Series", value_name="% still depositing")
                 .dropna()
             )
             join_month = survival_info["join_day"] / DAYS_PER_MONTH
@@ -4574,7 +4586,8 @@ with tab_retention:
                 .mark_line(point=True)
                 .encode(
                     x=alt.X(
-                        "Relative Month:Q",
+                        "Months since FTD:Q",
+                        title="Months since first deposit (30.4-day months)",
                         scale=alt.Scale(domain=[1, SURVIVAL_CURVE_MONTHS], nice=False),
                         axis=alt.Axis(tickMinStep=1, format="d"),
                     ),
@@ -4582,15 +4595,15 @@ with tab_retention:
                     color=alt.Color("Series:N", sort=["Forecast curve", "Observed"]),
                     strokeDash=alt.StrokeDash("Series:N", sort=["Forecast curve", "Observed"]),
                     tooltip=[
-                        "Series", "Relative Month",
+                        "Series", "Months since FTD",
                         alt.Tooltip("% still depositing:Q", format=".1f"),
                     ],
                 )
             )
             join_rule = (
-                alt.Chart(pd.DataFrame({"Relative Month": [join_month]}))
+                alt.Chart(pd.DataFrame({"Months since FTD": [join_month]}))
                 .mark_rule(strokeDash=[4, 4], opacity=0.6)
-                .encode(x="Relative Month:Q")
+                .encode(x="Months since FTD:Q")
             )
             st.altair_chart(
                 (curve_chart + join_rule).properties(height=350), use_container_width=True
