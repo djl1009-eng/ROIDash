@@ -85,6 +85,13 @@ projection of not-yet-lapsed accounts for the next 12 months. See
 build_deposit_lifetimes() first - its censoring rule is the part that's
 easy to get wrong.
 
+The "Early Quality Signals" tab fits a ridge regression, at account
+level on mature cohorts, predicting H-day LTV (before CPA) from the
+FTD month and the first 30 days of play, validates it out-of-time on
+the newest mature cohort, then scores younger cohorts by partner /
+campaign / commission to flag weak traffic early. See
+build_early_signal_frame() for how leakage is kept out of the features.
+
 The "30 Days % of Players Still Depositing" chart at the bottom of the
 FTD Cohort View is fed by a SEPARATE query (see
 load_deposit_lifecycle_data()) joining each account's FTD timestamp to
@@ -2086,6 +2093,348 @@ def project_unlapsed_accounts(lifetimes, S, months_ahead=SURVIVAL_PROJECTION_MON
         })
 
     return pd.DataFrame(rows).set_index("Month") if rows else pd.DataFrame()
+
+
+# ── EARLY QUALITY SIGNALS (predict horizon LTV from the first month) ──
+#
+# A ridge regression, fitted at ACCOUNT level on mature cohorts, that
+# predicts each account's H-day LTV (before CPA) from what's knowable
+# once its first month is in: FTD-month revenue, deposits and bonus
+# cost, landing page type, and how many days it actually played in its
+# first 30. Applied to young cohorts and averaged by partner, it flags
+# weak traffic months before the real LTV would show it.
+
+EARLY_SIGNAL_HORIZONS = {
+    "90 days": 90,
+    "180 days (6 months)": 180,
+    "365 days (12 months)": 365,
+}
+EARLY_SIGNAL_DEFAULT_HORIZON = "180 days (6 months)"
+
+# Out-of-time validation needs a test cohort AND at least this many
+# training cohorts before it, or the reported accuracy means nothing.
+EARLY_SIGNAL_MIN_TRAIN_COHORTS = 3
+
+# Target winsorised at these quantiles of the TRAINING set before
+# fitting. Player value is heavily skewed; without this a handful of
+# whales set the coefficients for everyone. Predictions are therefore of
+# a slightly trimmed mean - conservative at the top end, which is the
+# safe direction for a CPA decision.
+EARLY_SIGNAL_TARGET_WINSOR = (0.005, 0.995)
+
+# Ridge penalty on standardised features. Small - enough to keep the
+# correlated revenue features (GGR, deposits, profit) from fighting each
+# other into huge offsetting coefficients, not enough to bias much.
+EARLY_SIGNAL_RIDGE_ALPHA = 5.0
+
+# An account is only scored once it's this many days past its FTD, so
+# the "days played in days 1-30" features are complete for it.
+EARLY_SIGNAL_MIN_DAYS_OBSERVED = 30
+
+EARLY_SIGNAL_BASELINE_FEATURES = ["FTD-month profit", "Days live in FTD month"]
+
+
+def signed_log(values):
+    """sign(x) * log(1 + |x|) - tames the skew in money features while
+    keeping the sign, since FTD-month profit is often negative."""
+    v = np.asarray(values, dtype=float)
+    return np.sign(v) * np.log1p(np.abs(v))
+
+
+def build_early_signal_frame(df, daily_activity, include_fixed_costs, horizon_days, as_of=None):
+    """
+    One row per account: its early features, its H-day target, and the
+    metadata needed to group and judge it.
+
+    LEAKAGE IS THE THING TO AVOID HERE, and it shapes every feature:
+      - Revenue features come ONLY from the account's Relative Month 1
+        rows (its FTD calendar month), never from a day-weighted blend
+        of later months. The view is monthly, so weighting month 2 into
+        a "first 30 days" figure would smuggle in activity from after
+        day 30 - and the model would look better in validation than it
+        could ever be in use.
+      - Because an FTD on the 28th has 3 days in that month and one on
+        the 1st has 31, "Days live in FTD month" is a feature too, so
+        the model can tell a quiet account from a short one.
+      - Activity features come from the DAILY gaming data (Casino Data
+        By Day + All Bets Master Log placement dates), which is exact,
+        so days 1-30 really are days 1-30.
+      - The lifecycle data's last_successful_deposit is NOT used. It's a
+        live snapshot, so for a mature account it reveals how long the
+        account went on to last - the very thing being predicted.
+
+    Target: H-day profit per account on the before-CPA basis (the same
+    basis as the 1-Month/3-Month LTV rows, so it can be compared with
+    a CPA directly), day-weighted from the monthly rows as in
+    build_windowed_ltv(). Only meaningful where `mature` is True.
+
+    Account grain, not row grain: an account with several commissions
+    is ONE observation, and its group (partner, campaign, commission) is
+    taken as the lowest ID among its rows, as in the model export.
+    """
+    as_of_ts = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.today().normalize()
+    per_account, _ = account_ftd_dates(df)
+    if per_account.empty:
+        return pd.DataFrame()
+
+    scoped = df[df["Original player ID"].astype(str).isin(per_account.index)].copy()
+    scoped["_account"] = scoped["Original player ID"].astype(str)
+    relative_month = pd.to_numeric(scoped["Relative Month"], errors="coerce").round()
+
+    def c(frame, col):
+        return frame[col] if col in frame.columns else 0.0
+
+    first = scoped[relative_month == 1]
+    first_month = pd.DataFrame({
+        "_account": first["_account"],
+        "ftd_profit": row_level_profit(first, False, include_fixed_costs),
+        "ftd_casino_ggr": c(first, "Casino GGR"),
+        "ftd_sports_ggr": c(first, "SB GGR") + c(first, "SB Correction"),
+        "ftd_bonus": (c(first, "Free Spins Payout") + c(first, "Free Bet Payout")
+                      + c(first, "BOG Bonus") + c(first, "Lucky Bonus")),
+        "ftd_deposits": c(first, "Deposits sum"),
+        "ftd_deposit_count": c(first, "Deposits count"),
+    }).groupby("_account").sum()
+
+    weights = row_weights_for_window(window_weight_terms(scoped, per_account), horizon_days)
+    profit, upfront = before_cpa_profit_terms(scoped, include_fixed_costs)
+    target = windowed_profit(profit, upfront, weights).groupby(scoped["_account"]).sum()
+    cpa_paid = (c(scoped, "Actual_Fixed_Fee") * 1.2).groupby(scoped["_account"]).sum()
+
+    def lowest(col):
+        return scoped.dropna(subset=[col]).sort_values(col).groupby("_account")[col].first()
+
+    frame = pd.DataFrame(index=per_account.index)
+    frame.index.name = "account"
+    frame["ftd_date"] = per_account
+    frame["FTD Month"] = scoped.groupby("_account")["FTD Month"].first()
+    for col in ("Partner ID", "Campaign ID", "Commission ID"):
+        if col in scoped.columns:
+            frame[col] = lowest(col)
+    if "Landing Page Type" in scoped.columns:
+        frame["Landing Page Type"] = (
+            scoped.dropna(subset=["Landing Page Type"]).groupby("_account")["Landing Page Type"].first()
+        )
+    frame = frame.join(first_month, how="left")
+    money_cols = ["ftd_profit", "ftd_casino_ggr", "ftd_sports_ggr", "ftd_bonus",
+                  "ftd_deposits", "ftd_deposit_count"]
+    frame[money_cols] = frame[money_cols].fillna(0.0)
+    frame["target"] = target
+    frame["cpa_paid"] = cpa_paid.reindex(frame.index).fillna(0.0)
+
+    ftd_dates = pd.to_datetime(frame["ftd_date"])
+    month_end = ftd_dates.dt.to_period("M").dt.end_time.dt.normalize()
+    frame["days_live_in_ftd_month"] = (month_end - ftd_dates).dt.days + 1
+    frame["days_observed"] = (as_of_ts - ftd_dates).dt.days + 1
+
+    frame["has_daily"] = daily_activity is not None and not daily_activity.empty
+    if frame["has_daily"].all():
+        daily = daily_activity.copy()
+        daily["_account"] = daily["player_id"].astype(str)
+        daily = daily.drop_duplicates(subset=["_account", "relative_day"])
+        frame["played_1_30"] = (
+            daily[daily["relative_day"] <= 30].groupby("_account").size().reindex(frame.index).fillna(0)
+        )
+        frame["played_15_30"] = (
+            daily[daily["relative_day"].between(15, 30)].groupby("_account").size()
+            .reindex(frame.index).fillna(0)
+        )
+
+    observable = cohort_observable_days(frame["FTD Month"].dropna().unique(), as_of_ts)
+    frame["mature"] = frame["FTD Month"].map(observable).fillna(-1) >= horizon_days
+    return frame
+
+
+def early_signal_features(frame):
+    """
+    The model's design matrix. Built once from the WHOLE frame and only
+    split into train/score afterwards, so the landing-page dummy columns
+    are identical on both sides.
+    """
+    X = pd.DataFrame(index=frame.index)
+    X["FTD-month profit"] = signed_log(frame["ftd_profit"])
+    X["FTD-month casino GGR"] = signed_log(frame["ftd_casino_ggr"])
+    X["FTD-month sports GGR"] = signed_log(frame["ftd_sports_ggr"])
+    X["FTD-month bonus cost"] = signed_log(frame["ftd_bonus"])
+    X["FTD-month deposits (£)"] = signed_log(frame["ftd_deposits"])
+    X["FTD-month deposit count"] = np.log1p(frame["ftd_deposit_count"].clip(lower=0))
+    X["Days live in FTD month"] = frame["days_live_in_ftd_month"].astype(float)
+    if "played_1_30" in frame.columns:
+        X["Days played, days 1-30"] = frame["played_1_30"].astype(float)
+        X["Days played, days 15-30"] = frame["played_15_30"].astype(float)
+    if "Landing Page Type" in frame.columns:
+        for value in sorted(frame["Landing Page Type"].dropna().unique()):
+            X[f"Landing page: {value}"] = (frame["Landing Page Type"] == value).astype(float)
+    return X
+
+
+def fit_ridge(X, y, alpha=EARLY_SIGNAL_RIDGE_ALPHA):
+    """
+    Ridge regression on standardised features, closed form, numpy only.
+    Returns a model dict whose "beta" is per STANDARD DEVIATION of each
+    feature - directly comparable across features, which is what the
+    coefficient table shows.
+    """
+    mu = X.mean()
+    sd = X.std(ddof=0).replace(0, 1.0)
+    Z = ((X - mu) / sd).to_numpy(dtype=float)
+    y = np.asarray(y, dtype=float)
+    y_bar = float(y.mean())
+    p = Z.shape[1]
+    beta = np.linalg.solve(Z.T @ Z + alpha * np.eye(p), Z.T @ (y - y_bar))
+    return {"mu": mu, "sd": sd, "beta": pd.Series(beta, index=X.columns), "intercept": y_bar}
+
+
+def predict_ridge(model, X):
+    Z = ((X[model["beta"].index] - model["mu"]) / model["sd"]).to_numpy(dtype=float)
+    return model["intercept"] + Z @ model["beta"].to_numpy()
+
+
+def r_squared(actual, predicted):
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    ss_res = float(np.sum((actual - predicted) ** 2))
+    ss_tot = float(np.sum((actual - actual.mean()) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+
+def train_early_signal_model(frame, group_col, min_group_accounts,
+                             excluded_cohorts=PROJECTION_EXCLUDED_COHORTS):
+    """
+    Fits the model and reports how well it would have worked. Returns
+    (model, report) or (None, reason).
+
+    VALIDATION IS OUT-OF-TIME, which is the only kind that means
+    anything here: the most recent mature cohort is held out, the model
+    is fitted on the cohorts before it, and judged on the held-out one -
+    exactly the situation it'll be used in, predicting a newer cohort
+    from older ones. A random split would let every cohort's quirks leak
+    into both sides and flatter the result.
+
+    Reported on the held-out cohort:
+      - account-level R² for the full model and for a BASELINE using
+        only FTD-month profit (plus days live). The gap is what the
+        extra signals actually add; if it's small, the honest reading is
+        that first-month profit alone is nearly as good.
+      - group-level: correlation between each group's mean predicted and
+        mean actual LTV, for groups with min_group_accounts+ accounts -
+        the number that matters for flagging partners, since individual
+        accounts are noisy but partner averages needn't be.
+
+    After validation the model is REFIT on every mature cohort, test
+    included, so the scoring uses all the history there is.
+    """
+    mature = frame[frame["mature"] & frame["target"].notna()
+                   & ~frame["FTD Month"].isin(excluded_cohorts)]
+    cohorts = sorted(mature["FTD Month"].dropna().unique(), key=month_sort_key)
+    if len(cohorts) < EARLY_SIGNAL_MIN_TRAIN_COHORTS + 1:
+        return None, (
+            f"Only {len(cohorts)} cohort(s) are mature enough for this horizon - "
+            f"need {EARLY_SIGNAL_MIN_TRAIN_COHORTS + 1} (training cohorts plus one held "
+            "out to test on). Try a shorter horizon."
+        )
+
+    X_all = early_signal_features(frame)
+    test_cohort = cohorts[-1]
+    train = mature[mature["FTD Month"] != test_cohort]
+    test = mature[mature["FTD Month"] == test_cohort]
+
+    lo_q, hi_q = EARLY_SIGNAL_TARGET_WINSOR
+    lo, hi = train["target"].quantile(lo_q), train["target"].quantile(hi_q)
+    y_train = train["target"].clip(lo, hi)
+    y_test = test["target"].clip(lo, hi)
+
+    full = fit_ridge(X_all.loc[train.index], y_train)
+    baseline = fit_ridge(X_all.loc[train.index, EARLY_SIGNAL_BASELINE_FEATURES], y_train)
+    pred_full = predict_ridge(full, X_all.loc[test.index])
+    pred_base = predict_ridge(baseline, X_all.loc[test.index])
+
+    group_check = pd.DataFrame({
+        "group": test[group_col] if group_col in test.columns else pd.Series(index=test.index),
+        "actual": y_test,
+        "predicted": pred_full,
+    }).dropna(subset=["group"])
+    group_stats = group_check.groupby("group").agg(
+        accounts=("actual", "size"), actual=("actual", "mean"), predicted=("predicted", "mean")
+    )
+    group_stats = group_stats[group_stats["accounts"] >= min_group_accounts]
+    group_corr = (
+        float(group_stats["actual"].corr(group_stats["predicted"]))
+        if len(group_stats) >= 3 else float("nan")
+    )
+
+    lo_all, hi_all = mature["target"].quantile(lo_q), mature["target"].quantile(hi_q)
+    final = fit_ridge(X_all.loc[mature.index], mature["target"].clip(lo_all, hi_all))
+
+    report = {
+        "train_cohorts": [m for m in cohorts if m != test_cohort],
+        "test_cohort": test_cohort,
+        "n_train": int(len(train)),
+        "n_test": int(len(test)),
+        "r2_full": r_squared(y_test, pred_full),
+        "r2_baseline": r_squared(y_test, pred_base),
+        "group_corr": group_corr,
+        "group_check": group_stats,
+        "n_groups_checked": int(len(group_stats)),
+        "coefficients": final["beta"].sort_values(key=np.abs, ascending=False),
+        "features": X_all,
+    }
+    return final, report
+
+
+def score_early_signals(frame, model, features, group_col, min_group_accounts, weak_index):
+    """
+    Applies the fitted model to every account that's past its first 30
+    days but whose cohort isn't mature for the horizon yet - the accounts
+    the real LTV can't speak for yet - and rolls them up by group_col.
+
+    Per group: accounts scored, predicted LTV per player, its index
+    against the scored book as a whole (100 = average), the CPA actually
+    paid per player (VAT incl., from Actual_Fixed_Fee), and predicted
+    LTV minus that CPA. Status:
+      - "Too few accounts" below min_group_accounts - a partner average
+        over a handful of players is noise, however confident it looks
+      - "Weak" when the index is below weak_index
+      - "Below CPA" when predicted LTV doesn't cover the CPA paid
+      - "OK" otherwise
+    Both flags can apply; "Weak" is reported first.
+
+    Returns (table, n_scored, n_too_young).
+    """
+    candidates = frame[~frame["mature"]]
+    too_young = candidates["days_observed"] < EARLY_SIGNAL_MIN_DAYS_OBSERVED
+    scored = candidates[~too_young].copy()
+    if scored.empty or group_col not in scored.columns:
+        return pd.DataFrame(), 0, int(too_young.sum())
+
+    scored["predicted"] = predict_ridge(model, features.loc[scored.index])
+    book_mean = float(scored["predicted"].mean())
+
+    table = scored.dropna(subset=[group_col]).groupby(group_col).agg(
+        accounts=("predicted", "size"),
+        predicted=("predicted", "mean"),
+        cpa=("cpa_paid", "mean"),
+        cohorts=("FTD Month", lambda s: ", ".join(sorted(s.unique(), key=month_sort_key))),
+    )
+    table["index"] = 100 * table["predicted"] / book_mean if book_mean > 0 else float("nan")
+    table["margin"] = table["predicted"] - table["cpa"]
+
+    def status(row):
+        if row["accounts"] < min_group_accounts:
+            return "Too few accounts"
+        flags = []
+        if pd.notna(row["index"]) and row["index"] < weak_index:
+            flags.append("Weak")
+        if row["cpa"] > 0 and row["margin"] < 0:
+            flags.append("Below CPA")
+        return " + ".join(flags) if flags else "OK"
+
+    table["status"] = table.apply(status, axis=1)
+    order = {"Weak + Below CPA": 0, "Weak": 1, "Below CPA": 2, "OK": 3, "Too few accounts": 4}
+    table = table.sort_values(
+        by=["status", "predicted"], key=lambda s: s.map(order) if s.name == "status" else s
+    )
+    return table, int(len(scored)), int(too_young.sum())
 
 
 def build_cohort_table(df, include_affiliate_costs_in_ltv, include_fixed_costs, min_ftd_count=0,
@@ -4136,9 +4485,10 @@ if filtered.empty:
 
 # ── TABS ─────────────────────────────────────────────────────────────
 
-tab_cohort, tab_partner, tab_campaign, tab_commission, tab_retention, tab_export = st.tabs([
+(tab_cohort, tab_partner, tab_campaign, tab_commission,
+ tab_retention, tab_early, tab_export) = st.tabs([
     "FTD Cohort View", "By Partner", "By Campaign ID", "By Commission ID",
-    "Retention Forecast", "Model Export",
+    "Retention Forecast", "Early Quality Signals", "Model Export",
 ])
 
 with tab_cohort:
@@ -4671,6 +5021,169 @@ with tab_retention:
                     "come back. Read it as an upper bound on a month's depositors. "
                     "Reactivations of lapsed accounts aren't modelled, so a winback "
                     "campaign shows up as actuals beating this line."
+                )
+
+
+with tab_early:
+    st.subheader("Early quality signals")
+    st.caption(
+        "Predicts each account's LTV over a longer horizon from what's known once its "
+        "first month is in - FTD-month revenue, deposits and bonus cost, landing page, "
+        "and days played in its first 30 days - then averages those predictions by "
+        "group for cohorts too young to have a real figure yet. Fitted on the FULL "
+        "book, not the sidebar filters, so a filter can't shrink the training data "
+        "out from under it. LTV is on the before-CPA basis, so it can be read "
+        "straight against the CPA paid."
+    )
+
+    early_col1, early_col2, early_col3, early_col4 = st.columns(4)
+    early_horizon_label = early_col1.selectbox(
+        "Predict LTV over",
+        list(EARLY_SIGNAL_HORIZONS),
+        index=list(EARLY_SIGNAL_HORIZONS).index(EARLY_SIGNAL_DEFAULT_HORIZON),
+        key="early_horizon",
+        help=(
+            "Longer horizons are the more useful target but need cohorts that old to "
+            "learn from. With history back to Sep-25, 365 days won't have enough "
+            "mature cohorts until well into 2027."
+        ),
+    )
+    early_group_label = early_col2.selectbox(
+        "Group by", ["Partner", "Campaign ID", "Commission ID"], key="early_group"
+    )
+    early_min_accounts = early_col3.number_input(
+        "Min accounts per group", min_value=5, max_value=500, value=20, step=5,
+        key="early_min_accounts",
+        help="Groups with fewer scored accounts are shown but never flagged.",
+    )
+    early_weak_index = early_col4.number_input(
+        "Flag as weak below (index, 100 = book)", min_value=10, max_value=100,
+        value=60, step=5, key="early_weak_index",
+    )
+
+    early_horizon = EARLY_SIGNAL_HORIZONS[early_horizon_label]
+    early_group_col = "Partner ID" if early_group_label == "Partner" else early_group_label
+
+    with st.spinner("Building early-signal features..."):
+        early_frame = build_early_signal_frame(
+            df, load_gaming_activity_daily_data(True), include_fixed_costs, early_horizon
+        )
+
+    if early_frame.empty:
+        st.info("No accounts with a first deposit date to build features from.")
+    else:
+        if "played_1_30" not in early_frame.columns:
+            st.warning(
+                "Daily gaming activity didn't load, so the model is running without "
+                "the days-played features - usually the strongest early signal."
+            )
+        early_model, early_report = train_early_signal_model(
+            early_frame, early_group_col, int(early_min_accounts)
+        )
+        if early_model is None:
+            st.info(early_report)
+        else:
+            r = early_report
+            st.markdown("**How well it would have worked**")
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric("Held-out cohort", r["test_cohort"],
+                      help=f"Trained on {len(r['train_cohorts'])} older cohorts "
+                           f"({', '.join(r['train_cohorts'])}), {r['n_train']:,} accounts.")
+            v2.metric(
+                "Account-level R²", f"{r['r2_full']:.2f}",
+                delta=f"{r['r2_full'] - r['r2_baseline']:+.2f} vs FTD-month profit alone",
+                help=(
+                    "Share of the variation in individual accounts' LTV the model "
+                    "explains on the held-out cohort. Individual player value is "
+                    "noisy, so modest values are normal. The delta is what the extra "
+                    "signals add over first-month profit alone."
+                ),
+            )
+            v3.metric(
+                f"{early_group_label}-level correlation",
+                f"{r['group_corr']:.2f}" if pd.notna(r["group_corr"]) else "n/a",
+                help=(
+                    f"Correlation between each {early_group_label.lower()}'s mean "
+                    "predicted and mean actual LTV in the held-out cohort, over "
+                    f"{r['n_groups_checked']} groups with {int(early_min_accounts)}+ "
+                    "accounts. This is the number that matters for flagging - it says "
+                    "whether the model ranks groups correctly. n/a means fewer than 3 "
+                    "groups were big enough to check."
+                ),
+            )
+            v4.metric("Accounts tested", f"{r['n_test']:,}")
+
+            with st.expander("Backtest by group (held-out cohort)"):
+                check = r["group_check"].copy()
+                if early_group_col == "Partner ID" and partner_names:
+                    check = check.rename(index=lambda pid: partner_display_name(pid, partner_names))
+                check = check.sort_values("actual", ascending=False)
+                st.dataframe(
+                    pd.DataFrame({
+                        "Accounts": check["accounts"].map(lambda v: f"{v:,.0f}"),
+                        "Actual LTV": check["actual"].map(format_currency),
+                        "Predicted LTV": check["predicted"].map(format_currency),
+                    }),
+                    use_container_width=True,
+                )
+
+            with st.expander("Which early signals matter"):
+                coefficients = r["coefficients"]
+                st.dataframe(
+                    pd.DataFrame({
+                        "Effect of +1 standard deviation": coefficients.map(
+                            lambda v: f"{'+' if v >= 0 else '−'}£{abs(v):,.0f}"
+                        )
+                    }),
+                    use_container_width=True,
+                )
+                st.caption(
+                    "Each figure is the change in predicted LTV per player for a one "
+                    "standard deviation rise in that signal, holding the others fixed. "
+                    "The revenue signals overlap heavily, so their split between them "
+                    "is less meaningful than their combined weight - don't read a "
+                    "negative coefficient on one of them as that thing being bad."
+                )
+
+            st.divider()
+            st.markdown(f"**Young cohorts, scored by {early_group_label.lower()}**")
+            early_table, n_scored, n_too_young = score_early_signals(
+                early_frame, early_model, r["features"], early_group_col,
+                int(early_min_accounts), float(early_weak_index),
+            )
+            if early_table.empty:
+                st.info("No accounts are past their first 30 days in cohorts younger than the horizon.")
+            else:
+                if early_group_col == "Partner ID" and partner_names:
+                    early_table = early_table.rename(
+                        index=lambda pid: partner_display_name(pid, partner_names)
+                    )
+                display = pd.DataFrame({
+                    "Status": early_table["status"],
+                    "Accounts": early_table["accounts"].map(lambda v: f"{v:,.0f}"),
+                    f"Predicted {early_horizon}-day LTV": early_table["predicted"].map(format_currency),
+                    "Index (100 = book)": early_table["index"].map(
+                        lambda v: "n/a" if pd.isna(v) else f"{v:,.0f}"
+                    ),
+                    "CPA paid per player": early_table["cpa"].map(format_currency),
+                    "Predicted LTV − CPA": early_table["margin"].map(format_currency),
+                    "Cohorts": early_table["cohorts"],
+                })
+                display.index.name = early_group_label
+                st.dataframe(display, use_container_width=True,
+                             height=min(35 * len(display) + 80, 700))
+                st.caption(
+                    f"{n_scored:,} accounts scored. "
+                    + (f"{n_too_young:,} more are under {EARLY_SIGNAL_MIN_DAYS_OBSERVED} "
+                       "days past their FTD and will be scored once their first 30 days "
+                       "are complete. " if n_too_young else "")
+                    + "Predicted LTV is a trimmed mean (the training target is winsorised "
+                    "to stop a few whales setting the coefficients), so it reads slightly "
+                    "low for partners whose value comes from a small number of very large "
+                    "players. CPA paid is the actual Actual_Fixed_Fee plus VAT on these "
+                    "accounts, so a partner on a deal that hasn't been costed yet shows £0. "
+                    "The model learns from the book's past mix: a partner sending a "
+                    "genuinely new kind of traffic is the case it's least able to judge."
                 )
 
 
