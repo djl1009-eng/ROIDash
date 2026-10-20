@@ -71,6 +71,12 @@ different bases at once:
 The row labels carry the basis in force (see deduction_basis_labels()),
 so an exported screenshot can't be misread as the default one.
 
+"Exclude Promo Abuse" (default OFF) removes every account whose
+customer_data stake_factor is in PROMO_ABUSE_STAKE_FACTORS (currently
+0.65). It's an account filter like the status checkboxes, applied
+before the outlier exclusion, and like them it uses the CURRENT
+snapshot value - see load_stake_factor_data().
+
 Player LTV's detail rows include a "Projected 12-Month LTV" - each
 cohort's actual profit per player through its completed months plus
 the whole book's average per-player increments for the months still to
@@ -215,6 +221,12 @@ MIN_COHORT_COVERAGE_PER_POINT = 0.9
 # ends up with a NULL last deposit and gets excluded, which the caption
 # under the chart reports.
 CUSTOMER_DATA_JOIN_KEY = "wallet_code"
+
+# customer_data.stake_factor values that mark an account as promo abuse
+# for the "Exclude Promo Abuse" sidebar toggle. Compared after rounding
+# to 4dp, since stake_factor is a float and 0.65 isn't exactly
+# representable - a straight == can miss on storage noise.
+PROMO_ABUSE_STAKE_FACTORS = (0.65,)
 
 
 # ── PASSWORD GATE ────────────────────────────────────────────────────
@@ -700,6 +712,44 @@ def load_account_status_data():
             "have a status breakdown. The rest of the dashboard is unaffected."
         )
         return pd.DataFrame(columns=["player_key", "account_status"])
+
+
+@st.cache_data(ttl=600)
+def load_stake_factor_data():
+    """
+    Every (customer key, stake_factor) pair in customer_data, used by the
+    "Exclude Promo Abuse" toggle.
+
+    Deliberately NOT aggregated with MAX() the way account_status is: if
+    customer_data ever holds two rows for a key with different stake
+    factors, MAX would pick 1.0 over 0.65 and silently un-flag the
+    account. Returning the distinct pairs lets the caller flag an account
+    if ANY of its rows carries a promo-abuse stake factor.
+
+    Like account_status, this is a LIVE snapshot - an account tagged
+    today is excluded from every cohort it appears in, including months
+    before it was tagged.
+
+    A failure here degrades to the toggle being disabled, not to the
+    dashboard going down.
+    """
+    conn = get_healthy_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '45000'")  # milliseconds
+        query = f'''
+            SELECT DISTINCT
+                "{CUSTOMER_DATA_JOIN_KEY}"::text AS player_key,
+                "stake_factor" AS stake_factor
+            FROM "customer_data"
+        '''
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.warning(
+            f"Couldn't load stake factors ({e}) - 'Exclude Promo Abuse' is "
+            "unavailable. The rest of the dashboard is unaffected."
+        )
+        return pd.DataFrame(columns=["player_key", "stake_factor"])
 
 
 PARTNER_ID_HEADER = "partner id"
@@ -1319,7 +1369,7 @@ def build_windowed_ltv(df, months, window_days, include_fixed_costs, as_of=None)
 
     The one assumption is that revenue within a month spreads evenly
     across the days the account was live in it. It does not - a young
-    cohort front-loads - and the window always covers the earliest of
+    cohort front-loads, and the window always covers the earliest of
     those days, so this reads slightly LOW, i.e. slightly conservative
     as a price ceiling. It also matters LESS the longer the window: at
     90 days only the final partial month is apportioned, against
@@ -4249,6 +4299,30 @@ if not account_status.empty:
             "\"Original player ID\"."
         )
 
+# Attach a per-account Promo Abuse flag to the FULL frame, same pattern
+# and same match-rate guard as Account Status above: if the join key
+# stops working, nothing would ever be flagged and the toggle would
+# silently do nothing, so the toggle is disabled with a warning instead.
+_promo_abuse_available = False
+stake_factors = load_stake_factor_data()
+if not stake_factors.empty:
+    stake_factors = stake_factors.dropna(subset=["player_key"])
+    sf_rounded = pd.to_numeric(stake_factors["stake_factor"], errors="coerce").round(4)
+    is_abuse_row = sf_rounded.isin([round(v, 4) for v in PROMO_ABUSE_STAKE_FACTORS])
+    abuse_keys = set(stake_factors.loc[is_abuse_row, "player_key"].astype(str))
+    known_keys = set(stake_factors["player_key"].astype(str))
+
+    account_keys = df["Original player ID"].astype(str)
+    if account_keys.isin(known_keys).any():
+        df["Promo Abuse"] = account_keys.isin(abuse_keys)
+        _promo_abuse_available = True
+    else:
+        st.warning(
+            "No accounts matched customer_data on "
+            f"{CUSTOMER_DATA_JOIN_KEY} for stake factors, so 'Exclude Promo "
+            "Abuse' is unavailable."
+        )
+
 # ── FILTERS ──────────────────────────────────────────────────────────
 
 st.sidebar.header("Filters")
@@ -4363,6 +4437,19 @@ included_status_labels = {
 }
 
 st.sidebar.divider()
+exclude_promo_abuse = st.sidebar.checkbox(
+    "Exclude Promo Abuse",
+    value=False,
+    disabled=not _promo_abuse_available,
+    help=(
+        "Removes every row belonging to an account whose customer_data "
+        f"stake_factor is {', '.join(str(v) for v in PROMO_ABUSE_STAKE_FACTORS)}. "
+        "Uses the CURRENT stake factor, so an account tagged today is removed "
+        "from every month it appears in, including months before the tag."
+    ),
+)
+
+st.sidebar.divider()
 include_affiliate_costs = st.sidebar.checkbox(
     "Include Affiliate Costs in Profit / Player LTV",
     value=False,
@@ -4455,6 +4542,17 @@ if _status_column_present and not filtered.empty and set(included_status_labels)
     st.sidebar.caption(
         f"Excluded {removed_count:,} of {before_count:,} accounts "
         f"({', '.join(excluded_labels).lower()})."
+    )
+
+# Before the outlier exclusion, for the same reason as the status filter:
+# the 5%/95% thresholds should be percentiles of the population actually
+# being analysed.
+if exclude_promo_abuse and _promo_abuse_available and not filtered.empty:
+    before_count = filtered["Original player ID"].nunique()
+    filtered = filtered[~filtered["Promo Abuse"]]
+    removed_count = before_count - filtered["Original player ID"].nunique()
+    st.sidebar.caption(
+        f"Excluded {removed_count:,} of {before_count:,} accounts as promo abuse."
     )
 
 if exclude_outlier_accounts and not filtered.empty:
@@ -5245,11 +5343,11 @@ with tab_export:
         "Apply the current sidebar filters",
         value=False,
         help=(
-            "Off by default, deliberately. The outlier and account-status "
-            "toggles remove accounts in ways that would bias a retention model "
-            "without being visible in the exported file - the survivorship "
-            "problem in miniature. Leave off unless you specifically want a "
-            "filtered slice."
+            "Off by default, deliberately. The outlier, account-status and "
+            "promo-abuse toggles remove accounts in ways that would bias a "
+            "retention model without being visible in the exported file - the "
+            "survivorship problem in miniature. Leave off unless you "
+            "specifically want a filtered slice."
         ),
     )
 
